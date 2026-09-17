@@ -1,0 +1,58 @@
+{
+  "name": "eve-cls-observability",
+  "version": "0.1.0",
+  "description": "Tencent Cloud CLS Agent observability provider for eve agents. Emits CLS Agent Trace spec spans over the native UploadLog API with a zero-dependency client.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "peerDependencies": {
+    "eve": ">=0.56.0 <0.57.0"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/core": "^2.11.0",
+    "@opentelemetry/exporter-trace-otlp-proto": "^0.222.0",
+    "@opentelemetry/resources": "^2.11.0",
+    "@opentelemetry/sdk-trace-base": "^2.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.3",
+    "eve": "^0.56.0",
+    "typescript": "^5.9.2"
+  },
+  "keywords": [
+    "eve",
+    "tencent-cloud",
+    "cls",
+    "observability",
+    "agent",
+    "llm-observability",
+    "tracing",
+    "opentelemetry"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Tinker-LGD2026/eve-cls-observability.git"
+  },
+  "homepage": "https://github.com/Tinker-LGD2026/eve-cls-observability#readme",
+  "bugs": "https://github.com/Tinker-LGD2026/eve-cls-observability/issues",
+  "license": "MIT"
+}
