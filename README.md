@@ -21,7 +21,7 @@ export default clsObservability(); // 配置走环境变量，开箱即用
 - [完整配置项](#完整配置项)
 - [客户可以自定义什么](#客户可以自定义什么)
 - [内容采集与隐私（两道门）](#内容采集与隐私两道门)
-- [生产部署建议](#生产部署建议)
+- [部署：物理机 / 虚拟机 / 容器 / K8s](#部署物理机--虚拟机--容器--k8s)
 - [对你的应用有多大影响](#对你的应用有多大影响)
 - [兼容性](#兼容性)
 - [排障](#排障)
@@ -260,12 +260,176 @@ export default clsObservability({
 
 > **成本提示**：正文是日志写流量的主要来源。生产环境建议先只开 `recordOutputs`（模型输出通常比全量上下文小得多），评估流量成本后再决定是否开输入。
 
-## 生产部署建议
+## 部署：物理机 / 虚拟机 / 容器 / K8s
 
-- **密钥不进代码、不进镜像**：通过运行环境注入 `CLS_*` 环境变量（K8s Secret、systemd `EnvironmentFile`、CI/CD 密钥管理等），优先级：代码传参 > 环境变量。
-- **多副本部署无需特殊处理**：span 状态在进程内维护且有 LRU 上限，同一 session 的轮次计数在单进程内自洽；会话被路由到不同副本时会自然开始新的 span 上下文，不影响检索。
-- **内存有界**：`maxTrackedSessions`（默认 1000）+ `stateTtlMs`（默认 30 分钟）双重约束，长跑服务不会因状态累积涨内存。
-- **启动即校验**：必填配置缺失、topic/region 格式错误、数值越界都会在 `clsObservability()` 调用时直接抛错——宁可启动时明确失败，也不要上线后才发现一直没数据。
+### 集成模型（先说清一件事）
+
+本插件**不是独立服务**，它是编译进你的 eve 应用里的一个库。所谓"集成到某种环境"，本质只有三件事：
+
+1. 应用装了 `eve-cls-observability`（`npm install`，随 `eve build` 一起打进产物）
+2. 进程启动时能拿到 4 个 `CLS_*` 环境变量
+3. 进程能出网访问 `cls.{region}.tencentcloudapi.com:443`（HTTPS）
+
+eve 应用的生产形态：`eve build` 产出标准 Nitro server（`.output/` 目录），`eve start` 以**长驻 Node 进程**运行（Node.js >= 24）。以下各环境只是这三件事的不同落地方式。
+
+**所有环境共通的原则**：
+
+- **密钥不进代码、不进镜像**：运行时注入环境变量，优先级为代码传参 > 环境变量
+- **启动即校验**：必填配置缺失、格式错误会在 `clsObservability()` 调用时直接抛错——宁可启动时明确失败，也不要上线后才发现一直没数据
+- **退出无需手写清理**：进程退出时 eve 框架自动调用插件的 `flush`/`shutdown` 生命周期排空缓冲
+- **内存有界**：`maxTrackedSessions`（默认 1000，LRU 淘汰）+ `stateTtlMs`（默认 30 分钟）双重约束，长跑服务不会因状态累积涨内存
+
+### 物理机 / 虚拟机（systemd）
+
+```bash
+# 1. 安装 Node.js >= 24，拉代码，装依赖，构建
+npm ci
+npx eve build
+
+# 2. 写环境文件（独立文件、权限 600，不要写进 unit 文件本体）
+sudo install -m 600 /dev/null /etc/myagent/env
+sudo tee /etc/myagent/env <<'EOF'
+CLS_TOPIC_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+CLS_REGION=ap-shanghai
+CLS_SECRET_ID=AKIDxxxxxxxxxxxxxxxx
+CLS_SECRET_KEY=xxxxxxxxxxxxxxxx
+EOF
+```
+
+`/etc/systemd/system/myagent.service`：
+
+```ini
+[Unit]
+Description=My eve agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/myagent/env
+WorkingDirectory=/opt/myagent
+ExecStart=/usr/bin/npx eve start --host 0.0.0.0 --port 3000
+Restart=always
+RestartSec=3
+# eve 收到 SIGTERM 后内部需要最多约 20 秒优雅退出（含插件缓冲排空），systemd 默认 90 秒足够；
+# 如果你全局收紧过 TimeoutStopSec，这里不要低于 30
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl enable --now myagent
+journalctl -u myagent -f   # 开了 CLS_OBS_DEBUG=1 时，插件诊断日志在这里看
+```
+
+> 如果前面挂了 Nginx 反向代理，必须同时转发 `/eve/` 和 `/.well-known/workflow/` 两个前缀（eve workflow 回调的要求），漏配会让 agent run 卡住——这与本插件无关，但自托管时经常一起踩到。
+
+### Docker 容器
+
+多阶段 Dockerfile——**构建期不需要任何密钥，密钥只在 `docker run` 时注入**：
+
+```dockerfile
+# ---------- 构建 ----------
+FROM node:24-slim AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npx eve build          # 产物在 .output/
+
+# ---------- 运行 ----------
+FROM node:24-slim
+WORKDIR /app
+ENV NODE_ENV=production
+COPY package*.json ./
+RUN npm ci --omit=dev      # eve start 需要 CLI
+COPY --from=build /app/.output ./.output
+EXPOSE 3000
+STOPSIGNAL SIGTERM
+CMD ["npx", "eve", "start", "--host", "0.0.0.0", "--port", "3000"]
+```
+
+```bash
+docker build -t myagent:1.0.0 .
+docker run -d --name myagent \
+  -p 3000:3000 \
+  -e CLS_TOPIC_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
+  -e CLS_REGION=ap-shanghai \
+  -e CLS_SECRET_ID=AKIDxxxxxxxxxxxxxxxx \
+  -e CLS_SECRET_KEY=xxxxxxxxxxxxxxxx \
+  --stop-timeout 30 \
+  myagent:1.0.0
+```
+
+要点：
+
+- **密钥绝不进镜像层**：不要 `ENV CLS_SECRET_KEY=...`，也不要把 `.env.local` COPY 进镜像（确认 `.dockerignore` 覆盖了 `.env*`）；用 `-e`、权限受控的 `--env-file` 或编排平台的 Secret 注入
+- **停止宽限**：`docker stop` 默认 10 秒，可能截断退出时的缓冲排空，建议 `--stop-timeout 30`
+- 镜像基于 `node:24-slim` 即可，插件无原生扩展、无额外系统依赖
+
+### Kubernetes / TKE
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: myagent-cls
+type: Opaque
+stringData:
+  CLS_TOPIC_ID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+  CLS_REGION: ap-shanghai
+  CLS_SECRET_ID: AKIDxxxxxxxxxxxxxxxx
+  CLS_SECRET_KEY: xxxxxxxxxxxxxxxx
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myagent
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: myagent }
+  template:
+    metadata:
+      labels: { app: myagent }
+    spec:
+      terminationGracePeriodSeconds: 30   # 覆盖 eve 优雅退出 + 插件缓冲排空
+      containers:
+        - name: myagent
+          image: registry.example.com/myagent:1.0.0
+          ports: [{ containerPort: 3000 }]
+          envFrom:
+            - secretRef: { name: myagent-cls }
+          env:
+            - name: CLS_SERVICE_NAME      # 可选：在 CLS 侧区分应用
+              value: customer-service-bot
+          readinessProbe:
+            httpGet: { path: /, port: 3000 }
+```
+
+**多副本无需特殊处理**：span 状态在进程内维护（LRU + TTL 上限），同一会话被路由到不同副本时会自然开始新的 span 上下文，不影响 CLS 侧按 `session.id` 检索聚合，**不需要 sticky session**。
+
+### Vercel（Serverless）
+
+`eve deploy` 部署到 Vercel 时：
+
+- 4 个 `CLS_*` 变量配在 Vercel 项目的 Environment Variables（Production / Preview 分开配置）
+- Serverless 没有可靠的"进程退出"时机，但 eve 会在**每个 turn / 会话结束时自动调用插件 flush**，数据不会因实例冻结而滞留——这是框架托管生命周期的价值，你无需任何额外代码
+- 内容采集的第二道门按 `VERCEL_ENV` 判定：`production` 环境下只有 public audience 会话放行正文（见[内容采集与隐私](#内容采集与隐私两道门)）
+
+### 网络与出网要求
+
+| 项 | 值 |
+|---|---|
+| 目的地址 | `cls.{region}.tencentcloudapi.com`（可用 `apiHost` 覆盖） |
+| 端口 / 协议 | 443 / HTTPS（TC3 签名在应用层完成，传输本身也是 TLS） |
+| 方向 | **仅出向（egress）**，不需要任何入向端口、公网 IP 或安全组放行 |
+| 腾讯云 VPC 内 | 该域名可经 PrivateDNS 解析到内网接入点，无需改配置、免公网流量费 |
+| 专有云 / 自建接入点 | 用 `apiHost` + `allowCustomEndpoint: true`（先过 SSRF 评审，见配置章节） |
+
+**关于 STS 临时密钥**：插件在 `clsObservability()` 调用时（进程启动）读取一次 `CLS_TOKEN`，长驻进程不会自动刷新。使用 STS 的场景请配合滚动重启/重新部署刷新凭据；长驻物理机 / 虚拟机 / 容器更推荐 CAM 子账号长期密钥（最小权限 `cls:PushLog`）。
 
 ## 对你的应用有多大影响
 
@@ -293,8 +457,9 @@ export default clsObservability({
 1. **topic ID 填错了**：确认 `CLS_TOPIC_ID` 是日志主题 ID（UUID 格式）而不是 Agent 应用 ID——这是头号原因
 2. **地域不匹配**：`CLS_REGION` 必须与主题实际所属地域一致
 3. **密钥权限不足**：密钥需要目标主题的写日志权限（`cls:PushLog`）；用 `CLS_OBS_DEBUG=1` 看是否有签名/权限报错
-4. **没开 provider 布局**：确认 `agent/agent.ts` 里有 `experimental: { instrumentationProviders: true }`
-5. **多等几秒**：批量导出默认 2 秒一批，控制台索引也有秒级延迟
+4. **出网不通**：在容器/虚机里 `curl -v https://cls.{region}.tencentcloudapi.com` 确认 443 可达（公司内网、出口防火墙、K8s NetworkPolicy 是常见拦截点）
+5. **没开 provider 布局**：确认 `agent/agent.ts` 里有 `experimental: { instrumentationProviders: true }`
+6. **多等几秒**：批量导出默认 2 秒一批，控制台索引也有秒级延迟
 
 ### 调用链有，但看不到输入/输出消息正文
 
