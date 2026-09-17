@@ -20,7 +20,7 @@ export default clsObservability(); // 配置走环境变量，开箱即用
 - [工作原理](#工作原理)
 - [完整配置项](#完整配置项)
 - [客户可以自定义什么](#客户可以自定义什么)
-- [内容采集与隐私（两道门）](#内容采集与隐私两道门)
+- [内容采集与隐私](#内容采集与隐私)
 - [部署：物理机 / 虚拟机 / 容器 / K8s](#部署物理机--虚拟机--容器--k8s)
 - [对你的应用有多大影响](#对你的应用有多大影响)
 - [兼容性](#兼容性)
@@ -143,13 +143,9 @@ CLS_OBS_DEBUG=1 npm run dev
 
 span 之间通过 ID 链关联：`turn.id = {sessionId}:t{N}`、`step.id = {turnId}:s{N}`，控制台上因此能还原出完整的树状时间线。属性命名遵循 `gen_ai.*` 协议命名空间（OpenTelemetry GenAI 语义约定），eve 框架的扩展信息放在 `agent.eve.*` 下（如 `agent.eve.turn.sequence`、`agent.eve.channel.type`）。
 
-### 为什么默认走 UploadLog 而不是 OTLP
-
-CLS Agent 可观测的日志主题如果开启了**服务端精加工（数据转换）**，其 OTLP 接入管道在转换时会剥离 `gen_ai.input/output.messages` 消息正文，导致控制台看不到输入输出；UploadLog 直写则完整保留。因此插件默认使用 UploadLog 直写。如果你的主题没有开启转换、或者你想双写一份到另一个主题，可以配置 [OTLP 镜像](#otlp-镜像双写)。
-
 ## 完整配置项
 
-所有配置都可以通过 `clsObservability({...})` 传参，**代码传参优先级高于环境变量**。除连接配置外，其余均有安全的生产默认值，一般只需要配置第 3 步的 4 个环境变量。
+以下所有选项都是**本插件自己的参数**，通过 `clsObservability({...})` 传参，**代码传参优先级高于环境变量**。除连接配置外，其余均有安全的生产默认值，一般只需要配置第 3 步的 4 个环境变量。
 
 ### 连接配置（必填，缺失时启动即报错）
 
@@ -219,7 +215,7 @@ export default clsObservability({
 
 ### OTLP 镜像双写
 
-把 span 以 OTLP 协议额外写一份到其他 CLS 主题（例如无转换的主题做原始留存）：
+把 span 以 OTLP 协议额外写一份到其他 CLS 主题（例如备份留存、多主题分发）：
 
 ```ts
 export default clsObservability({
@@ -247,18 +243,36 @@ export default clsObservability({
 
 之后可在 CLS 检索中按 `resource.service.name`、`resource.deployment.environment` 过滤。
 
-## 内容采集与隐私（两道门）
+## 内容采集与隐私
 
-消息正文涉及用户隐私和日志成本，本插件采用**两道门**设计，默认全部关闭：
+**默认行为：不采集任何消息正文**——不上报输入、输出、推理过程、会话标题、用户 ID，只上报结构化字段（span 名称、耗时、token 数、错误分类等），调用链功能完全不受影响。想看正文，按下面两步操作：
 
-**第一道门（插件层）**：`recordInputs` / `recordOutputs` 等开关默认 `false`，需要你显式开启。
+### 第一步：打开插件的采集开关
 
-**第二道门（eve 框架层，更硬）**：即使插件开了采集，eve 框架在**非 development 环境**下也只放行 `public` audience 会话的正文（框架级 `applyAudienceCeiling`，插件无法绕过）。因此：
+这些开关都是本插件的参数，在 `agent/instrumentation/cls.ts` 里设置：
 
-- 本地开发/联调：确保 `EVE_DEV=1` 或 `VERCEL_ENV=development`，或在 `agent/channels/` 中把会话 `audience` 设为 `"public"`
-- 生产环境：只有显式标记为 public 的会话才会采集正文——这是 eve 的隐私设计，**建议保留**，配合 `redact` 做字段级脱敏
+```ts
+export default clsObservability({
+  recordInputs: true,        // 采集输入消息正文
+  recordOutputs: true,       // 采集输出消息正文
+  // recordReasoning: true,      // 可选：模型推理过程
+  // recordSessionTitle: true,   // 可选：会话标题
+  // recordUserId: true,         // 可选：用户 ID（默认 SHA-256 哈希后上报）
+});
+```
 
-> **成本提示**：正文是日志写流量的主要来源。生产环境建议先只开 `recordOutputs`（模型输出通常比全量上下文小得多），评估流量成本后再决定是否开输入。
+### 第二步：确认你的环境放行正文
+
+打开插件开关后如果还看不到正文，是被 eve 框架自带的隐私闸拦住了：**非 development 环境下，只有 audience 为 `"public"` 的会话才放行正文**（eve 的隐私设计，插件无法也不应绕过）。按你的部署环境对号入座：
+
+| 你的环境 | 要做的操作 |
+|---|---|
+| 本地开发（`eve dev`） | **无需操作**——`eve dev` 自动按 development 环境放行 |
+| Vercel preview / development | **无需操作**——非 production 自动放行 |
+| 自托管生产（物理机 / 虚机 / 容器 / K8s） | 在 `agent/channels/` 的会话配置中把 `audience` 设为 `"public"` |
+| Vercel production | 同上：会话 `audience` 设为 `"public"` |
+
+> **生产环境放开正文前，请先评估隐私合规与日志成本**：正文是日志写流量的主要来源。建议先只开 `recordOutputs`（模型输出通常比全量输入上下文小得多），并配合 [`redact`](#自定义脱敏) 做字段级脱敏（如手机号、身份证号打码）。
 
 ## 部署：物理机 / 虚拟机 / 容器 / K8s
 
@@ -417,7 +431,7 @@ spec:
 
 - 4 个 `CLS_*` 变量配在 Vercel 项目的 Environment Variables（Production / Preview 分开配置）
 - Serverless 没有可靠的"进程退出"时机，但 eve 会在**每个 turn / 会话结束时自动调用插件 flush**，数据不会因实例冻结而滞留——这是框架托管生命周期的价值，你无需任何额外代码
-- 内容采集的第二道门按 `VERCEL_ENV` 判定：`production` 环境下只有 public audience 会话放行正文（见[内容采集与隐私](#内容采集与隐私两道门)）
+- 内容采集的环境判定按 `VERCEL_ENV` 进行：`production` 环境下只有 public audience 会话放行正文（见[内容采集与隐私](#内容采集与隐私)）
 
 ### 网络与出网要求
 
@@ -463,10 +477,10 @@ spec:
 
 ### 调用链有，但看不到输入/输出消息正文
 
-这是[两道门](#内容采集与隐私两道门)设计，逐项检查：
+正文默认关闭，且生产环境还有 eve 框架的隐私闸，按[内容采集与隐私](#内容采集与隐私)的两步逐项检查：
 
-1. 插件开关：`recordInputs: true` / `recordOutputs: true` 是否设置
-2. eve 框架门：生产环境下会话 audience 是否为 `"public"`；本地开发确认 `EVE_DEV=1` 或 `VERCEL_ENV=development`
+1. 插件开关：`recordInputs: true` / `recordOutputs: true` 是否已在 `clsObservability({...})` 中设置
+2. 环境放行：本地开发用 `eve dev` 启动；生产环境确认会话 audience 已设为 `"public"`
 3. 是否设置了 `redact` 把字段删掉了（`CLS_OBS_DEBUG=1` 可辅助确认）
 
 ### 启动时报 `missing required configuration`
