@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { safeJsonAttribute } from "./safe-json.js";
+import { serialize } from "node:v8";
 
 export interface MessageCursorOptions {
   readonly maxSessions: number;
@@ -11,23 +11,43 @@ export interface MessageCursorSnapshot {
   readonly version: number;
   readonly messageHashes: readonly string[];
   readonly fullHash: string;
+  readonly reliable: boolean;
   readonly updatedAtMs: number;
 }
 
 export type MessageAdvance<T> =
   | { readonly kind: "full"; readonly hash: string; readonly messages: readonly T[] }
-  | { readonly kind: "delta"; readonly hash: string; readonly messages: readonly T[] };
+  | { readonly kind: "delta"; readonly hash: string; readonly messages: readonly T[] }
+  | { readonly kind: "stale"; readonly hash: string; readonly messages: readonly T[] };
 
-function md5(value: string): string {
-  return createHash("md5").update(value).digest("hex");
+interface HashResult {
+  readonly hash: string;
+  readonly reliable: boolean;
 }
 
-function canonical(value: unknown): string {
-  return safeJsonAttribute(value, 16 * 1024 * 1024)?.json ?? "null";
+function structuralHash(value: unknown): HashResult {
+  try {
+    return {
+      hash: createHash("md5").update(serialize(value)).digest("hex"),
+      reliable: true,
+    };
+  } catch {
+    return {
+      hash: createHash("md5").update(String(value)).digest("hex"),
+      reliable: false,
+    };
+  }
 }
 
-function messageHashes(messages: readonly unknown[]): string[] {
-  return messages.map((message) => md5(canonical(message)));
+function messageHashes(messages: readonly unknown[]): {
+  readonly hashes: string[];
+  readonly reliable: boolean;
+} {
+  const results = messages.map((message) => structuralHash(message));
+  return {
+    hashes: results.map((result) => result.hash),
+    reliable: results.every((result) => result.reliable),
+  };
 }
 
 /** Bounded, content-free cursor used for append-only GenAI message deltas. */
@@ -45,12 +65,19 @@ export class MessageCursorStore {
 
   advance<T>(sessionId: string, messages: readonly T[], version: number): MessageAdvance<T> {
     this.evictExpired();
-    const hashes = messageHashes(messages);
-    const fullHash = md5(canonical(messages));
     const previous = this.#cursors.get(sessionId);
-    const isFresh = previous === undefined || version > previous.version;
+    if (previous !== undefined && version <= previous.version) {
+      return { kind: "stale", hash: previous.fullHash, messages: [] };
+    }
+    const messageHashResult = messageHashes(messages);
+    const fullHashResult = structuralHash(messages);
+    const hashes = messageHashResult.hashes;
+    const fullHash = fullHashResult.hash;
+    const reliable = messageHashResult.reliable && fullHashResult.reliable;
+    const isFresh = true;
     const extendsPrefix =
-      previous !== undefined &&
+      reliable &&
+      previous?.reliable === true &&
       previous.messageHashes.length < hashes.length &&
       previous.messageHashes.every((hash, index) => hash === hashes[index]);
 
@@ -60,6 +87,7 @@ export class MessageCursorStore {
         version,
         messageHashes: hashes,
         fullHash,
+        reliable,
         updatedAtMs: this.#now(),
       });
       this.#evictOverflow();

@@ -30,12 +30,33 @@ test("prefix change falls back to full", () => {
   assert.equal(result.kind, "full");
 });
 
-test("stale version does not overwrite a newer cursor", () => {
+test("stale version does not overwrite or re-emit an older prompt", () => {
   const store = new MessageCursorStore({ maxSessions: 10, ttlMs: 60_000 });
   store.advance("session-1", messages("one", "two"), 2);
   const result = store.advance("session-1", messages("old"), 1);
-  assert.equal(result.kind, "full");
+  assert.equal(result.kind, "stale");
+  assert.deepEqual(result.messages, []);
   assert.equal(store.snapshot()["session-1"].version, 2);
+});
+
+test("message hashes include content beyond the JSON preview node budget", () => {
+  const store = new MessageCursorStore({ maxSessions: 10, ttlMs: 60_000 });
+  const first = { role: "user", parts: Array.from({ length: 3_000 }, (_, index) => ({ index })) };
+  const changed = { role: "user", parts: [...first.parts] };
+  changed.parts[2_999] = { index: "changed" };
+  const initial = store.advance("session-1", [first], 1);
+  const updated = store.advance("session-1", [changed, { role: "assistant", parts: [] }], 2);
+  assert.notEqual(updated.hash, initial.hash);
+  assert.equal(updated.kind, "full");
+});
+
+test("unserializable messages force full fallback instead of a false delta", () => {
+  const store = new MessageCursorStore({ maxSessions: 10, ttlMs: 60_000 });
+  const first = { role: "user", value: 1, toJSON() {} };
+  store.advance("session-1", [first], 1);
+  const changed = { role: "user", value: 2, toJSON() {} };
+  const result = store.advance("session-1", [changed, { role: "assistant" }], 2);
+  assert.equal(result.kind, "full");
 });
 
 test("evicts expired and over-capacity cursors", () => {

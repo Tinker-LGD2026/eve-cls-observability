@@ -45,11 +45,15 @@ export function clsObservability(options: ClsObservabilityOptions = {}) {
   }
 
   return defineInstrumentation({
-    tracePolicy: () => ({
-      emit: true,
-      recordInputs: config.recordInputs,
-      recordOutputs: config.recordOutputs,
-    }),
+    tracePolicy: (traceContext) => {
+      const contentAllowed =
+        traceContext.audience === "public" || traceContext.environment === "development";
+      return {
+        emit: true,
+        recordInputs: config.recordInputs && contentAllowed,
+        recordOutputs: config.recordOutputs && contentAllowed,
+      };
+    },
     flush: () => pipeline.flush(),
     shutdown: () => store.shutdown(),
     events: {

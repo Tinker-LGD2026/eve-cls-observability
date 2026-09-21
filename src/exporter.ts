@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import { hostname } from "node:os";
 import { SpanKind, SpanStatusCode, type HrTime, type Tracer } from "@opentelemetry/api";
 import { ExportResultCode } from "@opentelemetry/core";
@@ -11,7 +12,7 @@ import {
 } from "@opentelemetry/sdk-trace-base";
 import { ClsWriter, type ClsLogEntry } from "./cls-writer.js";
 import type { AttributeRedactor, ResolvedConfig } from "./config.js";
-import { utf8Prefix } from "./content/safe-json.js";
+import { safeJsonAttribute, utf8Prefix } from "./content/safe-json.js";
 
 export interface SpanPipeline {
   readonly tracer: Tracer;
@@ -19,7 +20,21 @@ export interface SpanPipeline {
   readonly flush: () => Promise<void>;
 }
 
-const SDK_VERSION = "0.1.0";
+export const SDK_VERSION = (() => {
+  try {
+    const require = createRequire(import.meta.url);
+    return (require("eve-cls-observability/package.json") as { version?: string }).version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
+
+export function calculateExportTimeoutMillis(
+  requestTimeoutMs: number,
+  maxRetries: number,
+): number {
+  return requestTimeoutMs * (maxRetries + 1) + (maxRetries > 0 ? 30_000 : 0) + 5_000;
+}
 
 const KIND_NAMES: Record<number, string> = {
   [SpanKind.INTERNAL]: "internal",
@@ -56,6 +71,10 @@ function redactAttributes(
   return result;
 }
 
+function safeJson(value: unknown, maxBytes: number, fallback: string): string {
+  return safeJsonAttribute(value, maxBytes)?.json ?? fallback;
+}
+
 /** Maps one OTel span to the CLS Trace physical structure (spec §1). */
 export function spanToClsLogEntry(
   span: ReadableSpan,
@@ -76,22 +95,38 @@ export function spanToClsLogEntry(
     duration: (endNano - startNano).toString(),
     statusCode: STATUS_NAMES[span.status.code] ?? "UNSET",
     statusMessage: utf8Prefix(span.status.message ?? "", maxContentBytes),
-    links: JSON.stringify(
+    links: safeJson(
       span.links.map((link) => ({
         traceID: link.context.traceId,
         spanID: link.context.spanId,
-        ...(link.attributes !== undefined ? { attributes: link.attributes } : {}),
+        ...(link.attributes !== undefined
+          ? { attributes: redactAttributes(link.attributes, options?.redact) }
+          : {}),
       })),
+      maxContentBytes,
+      "[]",
     ),
-    logs: JSON.stringify(
+    logs: safeJson(
       span.events.map((event) => ({
         name: event.name,
-        ...(event.attributes !== undefined ? { attributes: event.attributes } : {}),
+        ...(event.attributes !== undefined
+          ? { attributes: redactAttributes(event.attributes, options?.redact) }
+          : {}),
       })),
+      maxContentBytes,
+      "[]",
     ),
     traceState: context.traceState?.serialize() ?? "",
-    resource: JSON.stringify(span.resource.attributes),
-    attribute: JSON.stringify(redactAttributes(span.attributes, options?.redact)),
+    resource: safeJson(
+      redactAttributes(span.resource.attributes, options?.redact),
+      maxContentBytes,
+      "{}",
+    ),
+    attribute: safeJson(
+      redactAttributes(span.attributes, options?.redact),
+      maxContentBytes,
+      "{}",
+    ),
   };
   return { timeMillis: Number(startNano / 1_000_000n), fields };
 }
@@ -102,6 +137,8 @@ class ClsSpanExporter implements SpanExporter {
   readonly #debug: boolean;
   readonly #maxContentBytes: number;
   readonly #redact?: AttributeRedactor;
+  readonly #inFlight = new Set<Promise<void>>();
+  #closed = false;
 
   constructor(
     writer: ClsWriter,
@@ -118,62 +155,173 @@ class ClsSpanExporter implements SpanExporter {
   }
 
   export(spans: ReadableSpan[], callback: (result: { code: ExportResultCode }) => void): void {
-    this.#writer
-      .putLogs(
-        spans.map((span) =>
-          spanToClsLogEntry(span, {
-            maxContentBytes: this.#maxContentBytes,
-            ...(this.#redact !== undefined ? { redact: this.#redact } : {}),
-          }),
-        ),
-      )
-      .then(() => {
+    if (this.#closed) {
+      callback({ code: ExportResultCode.FAILED });
+      return;
+    }
+    let entries: ClsLogEntry[];
+    try {
+      entries = spans.map((span) =>
+        spanToClsLogEntry(span, {
+          maxContentBytes: this.#maxContentBytes,
+          ...(this.#redact !== undefined ? { redact: this.#redact } : {}),
+        }),
+      );
+    } catch (error) {
+      this.#onError(error);
+      callback({ code: ExportResultCode.FAILED });
+      return;
+    }
+
+    const operation = this.#writer.putLogs(entries);
+    this.#inFlight.add(operation);
+    operation.then(
+      () => {
         if (this.#debug) {
           console.error(`[eve-cls-observability] uploaded ${spans.length} spans`);
         }
         callback({ code: ExportResultCode.SUCCESS });
-      })
-      .catch((error: unknown) => {
+      },
+      (error: unknown) => {
         this.#onError(error);
         callback({ code: ExportResultCode.FAILED });
-      });
+      },
+    ).finally(() => this.#inFlight.delete(operation));
+  }
+
+  async forceFlush(): Promise<void> {
+    await this.#writer.flush();
+    await Promise.all([...this.#inFlight]);
   }
 
   async shutdown(): Promise<void> {
-    // Nothing to release: PutLogs has no persistent connection.
+    this.#closed = true;
+    await this.#writer.shutdown();
+    await Promise.all([...this.#inFlight]);
   }
 }
 
-/** Fans one span batch out to every configured destination. */
-class FanoutSpanExporter implements SpanExporter {
-  readonly #exporters: readonly SpanExporter[];
+export function redactReadableSpan(
+  span: ReadableSpan,
+  redact: AttributeRedactor | undefined,
+): ReadableSpan {
+  if (redact === undefined) return span;
+  const resource = Object.create(span.resource) as typeof span.resource;
+  Object.defineProperty(resource, "attributes", {
+    value: redactAttributes(span.resource.attributes, redact),
+    enumerable: true,
+  });
+  return {
+    name: span.name,
+    kind: span.kind,
+    spanContext: () => span.spanContext(),
+    ...(span.parentSpanContext !== undefined
+      ? { parentSpanContext: span.parentSpanContext }
+      : {}),
+    startTime: span.startTime,
+    endTime: span.endTime,
+    status: span.status,
+    attributes: redactAttributes(span.attributes, redact) as never,
+    links: span.links.map((link) => ({
+      ...link,
+      ...(link.attributes !== undefined
+        ? { attributes: redactAttributes(link.attributes, redact) as never }
+        : {}),
+    })),
+    events: span.events.map((event) => ({
+      ...event,
+      ...(event.attributes !== undefined
+        ? { attributes: redactAttributes(event.attributes, redact) as never }
+        : {}),
+    })),
+    duration: span.duration,
+    ended: span.ended,
+    resource,
+    instrumentationScope: span.instrumentationScope,
+    droppedAttributesCount: span.droppedAttributesCount,
+    droppedEventsCount: span.droppedEventsCount,
+    droppedLinksCount: span.droppedLinksCount,
+  };
+}
 
-  constructor(exporters: readonly SpanExporter[]) {
-    this.#exporters = exporters;
+class RedactingSpanExporter implements SpanExporter {
+  readonly #delegate: SpanExporter;
+  readonly #redact: AttributeRedactor | undefined;
+
+  constructor(delegate: SpanExporter, redact: AttributeRedactor | undefined) {
+    this.#delegate = delegate;
+    this.#redact = redact;
   }
 
   export(spans: ReadableSpan[], callback: (result: { code: ExportResultCode }) => void): void {
-    let remaining = this.#exporters.length;
-    let failed = false;
-    for (const exporter of this.#exporters) {
-      exporter.export(spans, (result) => {
-        if (result.code !== ExportResultCode.SUCCESS) failed = true;
-        remaining -= 1;
-        if (remaining === 0) {
-          callback({ code: failed ? ExportResultCode.FAILED : ExportResultCode.SUCCESS });
-        }
-      });
+    this.#delegate.export(
+      spans.map((span) => redactReadableSpan(span, this.#redact)),
+      callback,
+    );
+  }
+
+  forceFlush(): Promise<void> {
+    return this.#delegate.forceFlush?.() ?? Promise.resolve();
+  }
+
+  shutdown(): Promise<void> {
+    return this.#delegate.shutdown();
+  }
+}
+
+/** Exports to primary CLS while treating optional mirrors as best-effort. */
+class FanoutSpanExporter implements SpanExporter {
+  readonly #primary: SpanExporter;
+  readonly #mirrors: readonly SpanExporter[];
+
+  constructor(primary: SpanExporter, mirrors: readonly SpanExporter[]) {
+    this.#primary = primary;
+    this.#mirrors = mirrors;
+  }
+
+  export(spans: ReadableSpan[], callback: (result: { code: ExportResultCode }) => void): void {
+    for (const mirror of this.#mirrors) {
+      try {
+        mirror.export(spans, (result) => {
+          if (result.code !== ExportResultCode.SUCCESS) {
+            console.warn("eve-cls-observability: optional OTLP mirror export failed");
+          }
+        });
+      } catch {
+        console.warn("eve-cls-observability: optional OTLP mirror export failed");
+      }
+    }
+    try {
+      this.#primary.export(spans, callback);
+    } catch {
+      callback({ code: ExportResultCode.FAILED });
     }
   }
 
   async shutdown(): Promise<void> {
-    await Promise.allSettled(this.#exporters.map((exporter) => exporter.shutdown()));
+    let primaryError: unknown;
+    try {
+      await this.#primary.shutdown();
+    } catch (error) {
+      primaryError = error;
+    } finally {
+      await Promise.allSettled(this.#mirrors.map((exporter) => exporter.shutdown()));
+    }
+    if (primaryError !== undefined) throw primaryError;
   }
 
   async forceFlush(): Promise<void> {
-    await Promise.allSettled(
-      this.#exporters.map((exporter) => exporter.forceFlush?.() ?? Promise.resolve()),
-    );
+    let primaryError: unknown;
+    try {
+      await this.#primary.forceFlush?.();
+    } catch (error) {
+      primaryError = error;
+    } finally {
+      await Promise.allSettled(
+        this.#mirrors.map((exporter) => exporter.forceFlush?.() ?? Promise.resolve()),
+      );
+    }
+    if (primaryError !== undefined) throw primaryError;
   }
 }
 
@@ -194,24 +342,27 @@ export function createSpanPipeline(config: ResolvedConfig): SpanPipeline {
     maxBatchBytes: config.maxBatchBytes,
     ...(config.apiHost !== undefined ? { apiHost: config.apiHost } : {}),
   });
-  const destinations: SpanExporter[] = [
-    new ClsSpanExporter(
-      writer,
-      (error) => console.warn("eve-cls-observability: UploadLog export failed", error),
-      config.debug,
-      config.maxContentLength,
-      config.redact,
-    ),
-    ...config.otlpMirrors.map(
-      (mirror) =>
+  const primaryExporter = new ClsSpanExporter(
+    writer,
+    (error) => console.warn("eve-cls-observability: UploadLog export failed", error),
+    config.debug,
+    config.maxContentLength,
+    config.redact,
+  );
+  const mirrorExporters: SpanExporter[] = config.otlpMirrors.map(
+    (mirror) =>
+      new RedactingSpanExporter(
         new OTLPTraceExporter({
           url: mirror.endpoint,
           headers: mirror.headers,
         }),
-    ),
-  ];
+        config.redact,
+      ),
+  );
   const exporter: SpanExporter =
-    destinations.length === 1 ? destinations[0] : new FanoutSpanExporter(destinations);
+    mirrorExporters.length === 0
+      ? primaryExporter
+      : new FanoutSpanExporter(primaryExporter, mirrorExporters);
 
   const provider = new BasicTracerProvider({
     resource: resourceFromAttributes({
@@ -235,18 +386,26 @@ export function createSpanPipeline(config: ResolvedConfig): SpanPipeline {
         scheduledDelayMillis: config.scheduledDelayMillis,
         maxExportBatchSize: 128,
         // Must exceed the configured request/retry budget.
-        exportTimeoutMillis:
-          config.requestTimeoutMs * (config.maxRetries + 1) +
-          2_000 * config.maxRetries +
-          5_000,
+        exportTimeoutMillis: calculateExportTimeoutMillis(
+          config.requestTimeoutMs,
+          config.maxRetries,
+        ),
       }),
     ],
   });
 
   const flush = async (): Promise<void> => {
-    // Lifecycle flush/shutdown callers need the real failure. Agent event
-    // handlers do not call this in the normal turn hot path.
-    await provider.forceFlush();
+    // First drain spans still buffered by the processor, then always wait for
+    // batches that a scheduled export had already handed to the exporter.
+    let processorError: unknown;
+    try {
+      await provider.forceFlush();
+    } catch (error) {
+      processorError = error;
+    } finally {
+      await exporter.forceFlush?.();
+    }
+    if (processorError !== undefined) throw processorError;
   };
 
   return { tracer: provider.getTracer("eve-cls-observability", SDK_VERSION), provider, flush };

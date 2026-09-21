@@ -11,6 +11,7 @@ export interface ClsMessagePart {
 
 export interface ClsMessage {
   readonly role: string;
+  readonly kind?: string;
   readonly parts: readonly ClsMessagePart[];
 }
 
@@ -79,7 +80,13 @@ export function clsInputMessages(
         if (serialized !== undefined) parts.push(serialized);
       }
     }
-    if (parts.length > 0) out.push({ role: message.role, parts });
+    if (parts.length > 0) {
+      out.push({
+        role: message.role,
+        ...(typeof message.kind === "string" ? { kind: message.kind } : {}),
+        parts,
+      });
+    }
   }
   return out;
 }
@@ -149,20 +156,30 @@ export function normalizeFinishReason(reason: string): string {
   }
 }
 
-/** Extracts a system-prompt string from the instrumentation instructions value. */
-export function systemInstructionsText(instructions: unknown): string | undefined {
-  if (typeof instructions === "string") return instructions;
-  if (isRecord(instructions) && typeof instructions.content === "string") {
-    return instructions.content;
-  }
-  return undefined;
+function textFromInstruction(value: unknown): string[] {
+  if (typeof value === "string") return value.trim().length > 0 ? [value] : [];
+  if (Array.isArray(value)) return value.flatMap((item) => textFromInstruction(item));
+  if (!isRecord(value)) return [];
+  if (typeof value.content === "string") return textFromInstruction(value.content);
+  if (Array.isArray(value.content)) return textFromInstruction(value.content);
+  if (value.type === "text" && typeof value.text === "string") return textFromInstruction(value.text);
+  return [];
 }
 
-/** The last user message in a prompt, used to backfill entry/agent input. */
+/** Extracts all system-prompt text from the instrumentation instructions value. */
+export function systemInstructionsText(instructions: unknown): string | undefined {
+  const text = textFromInstruction(instructions);
+  return text.length > 0 ? text.join("\n") : undefined;
+}
+
+/** The last real user message in a prompt, used to backfill entry/agent input. */
 export function lastUserMessage(messages: readonly unknown[]): ClsMessage[] {
   const all = clsInputMessages(messages);
   for (let i = all.length - 1; i >= 0; i--) {
-    if (all[i].role === "user") return [all[i]];
+    if (all[i].role === "user" && all[i].kind === "user") return [all[i]];
+  }
+  for (let i = all.length - 1; i >= 0; i--) {
+    if (all[i].role === "user" && all[i].kind === undefined) return [all[i]];
   }
   return all.slice(0, 1);
 }

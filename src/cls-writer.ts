@@ -53,14 +53,20 @@ function encodeLog(entry: ClsLogEntry): Buffer {
   return Buffer.concat(parts);
 }
 
-function encodeLogGroupList(entries: readonly ClsLogEntry[]): Buffer {
-  const groupParts: Buffer[] = entries.map((entry) => messageField(1, encodeLog(entry)));
-  groupParts.push(stringField(3, "eve-cls-observability.log"));
-  groupParts.push(stringField(4, "eve-cls-observability"));
-  return messageField(1, Buffer.concat(groupParts));
+const LOG_GROUP_SUFFIX = Buffer.concat([
+  stringField(3, "eve-cls-observability.log"),
+  stringField(4, "eve-cls-observability"),
+]);
+
+function encodeLogGroupFromParts(logParts: readonly Buffer[]): Buffer {
+  return messageField(1, Buffer.concat([...logParts, LOG_GROUP_SUFFIX]));
 }
 
-function tc3Authorization(input: {
+export function encodeLogGroupList(entries: readonly ClsLogEntry[]): Buffer {
+  return encodeLogGroupFromParts(entries.map((entry) => messageField(1, encodeLog(entry))));
+}
+
+export function tc3Authorization(input: {
   readonly secretId: string;
   readonly secretKey: string;
   readonly host: string;
@@ -116,11 +122,14 @@ export interface ClsWriterOptions {
   readonly maxRetries?: number;
   readonly requestTimeoutMs?: number;
   readonly maxBatchBytes?: number;
+  /** Maximum delay between retry attempts. Default 30000 ms. */
+  readonly maxRetryDelayMs?: number;
   readonly onError?: (error: unknown) => void;
 }
 
 export interface ClsWriterStats {
   readonly uploadedSpans: number;
+  readonly droppedOversizedSpans: number;
   readonly failedBatches: number;
   readonly retryAttempts: number;
   readonly lastSuccessAtMs?: number;
@@ -129,6 +138,7 @@ export interface ClsWriterStats {
 
 interface MutableStats {
   uploadedSpans: number;
+  droppedOversizedSpans: number;
   failedBatches: number;
   retryAttempts: number;
   lastSuccessAtMs?: number;
@@ -159,26 +169,66 @@ function parseRetryAfter(value: string | null): number | undefined {
   return Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined;
 }
 
-function partitionEntries(entries: readonly ClsLogEntry[], maxBytes: number): ClsLogEntry[][] {
-  const batches: ClsLogEntry[][] = [];
-  let current: ClsLogEntry[] = [];
+async function readResponseText(response: Response, maxBytes = 64 * 1024): Promise<string> {
+  if (response.body === null) return "";
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value);
+      const remaining = maxBytes - total;
+      chunks.push(chunk.subarray(0, remaining));
+      total += Math.min(chunk.length, remaining);
+      if (chunk.length > remaining) break;
+    }
+  } finally {
+    if (total >= maxBytes) await reader.cancel().catch(() => undefined);
+  }
+  return Buffer.concat(chunks, total).toString("utf8");
+}
+
+interface PartitionedEntries {
+  readonly payloads: readonly Buffer[];
+  readonly spanCounts: readonly number[];
+  readonly droppedOversizedSpans: number;
+}
+
+function encodedListLength(groupLength: number): number {
+  return fieldKey(1, 2).length + varint(BigInt(groupLength)).length + groupLength;
+}
+
+function partitionEntries(entries: readonly ClsLogEntry[], maxBytes: number): PartitionedEntries {
+  const payloads: Buffer[] = [];
+  const spanCounts: number[] = [];
+  let current: Buffer[] = [];
+  let currentLength = LOG_GROUP_SUFFIX.length;
+  let droppedOversizedSpans = 0;
+
+  const flush = (): void => {
+    if (current.length === 0) return;
+    payloads.push(encodeLogGroupFromParts(current));
+    spanCounts.push(current.length);
+    current = [];
+    currentLength = LOG_GROUP_SUFFIX.length;
+  };
+
   for (const entry of entries) {
-    const candidate = [...current, entry];
-    if (encodeLogGroupList(candidate).length <= maxBytes) {
-      current = candidate;
+    const encoded = messageField(1, encodeLog(entry));
+    const singleLength = encodedListLength(LOG_GROUP_SUFFIX.length + encoded.length);
+    if (singleLength > maxBytes) {
+      flush();
+      droppedOversizedSpans += 1;
       continue;
     }
-    if (current.length === 0) {
-      throw new Error(`CLS log entry exceeds maxBatchBytes=${maxBytes}`);
-    }
-    batches.push(current);
-    current = [entry];
-    if (encodeLogGroupList(current).length > maxBytes) {
-      throw new Error(`CLS log entry exceeds maxBatchBytes=${maxBytes}`);
-    }
+    if (encodedListLength(currentLength + encoded.length) > maxBytes) flush();
+    current.push(encoded);
+    currentLength += encoded.length;
   }
-  if (current.length > 0) batches.push(current);
-  return batches;
+  flush();
+  return { payloads, spanCounts, droppedOversizedSpans };
 }
 
 function isRetryableStatus(status: number): boolean {
@@ -199,8 +249,16 @@ export class ClsWriter {
   readonly #maxRetries: number;
   readonly #requestTimeoutMs: number;
   readonly #maxBatchBytes: number;
+  readonly #maxRetryDelayMs: number;
   readonly #onError: (error: unknown) => void;
-  readonly #stats: MutableStats = { uploadedSpans: 0, failedBatches: 0, retryAttempts: 0 };
+  readonly #stats: MutableStats = {
+    uploadedSpans: 0,
+    droppedOversizedSpans: 0,
+    failedBatches: 0,
+    retryAttempts: 0,
+  };
+  #queue: Promise<void> = Promise.resolve();
+  #closing = false;
 
   constructor(options: ClsWriterOptions) {
     this.#secretId = options.secretId;
@@ -212,28 +270,60 @@ export class ClsWriter {
     this.#maxRetries = options.maxRetries ?? 2;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
     this.#maxBatchBytes = options.maxBatchBytes ?? Math.floor(4.5 * 1024 * 1024);
-    this.#onError =
-      options.onError ??
-      ((error) => console.warn("eve-cls-observability: UploadLog failed", error));
+    this.#maxRetryDelayMs = options.maxRetryDelayMs ?? 30_000;
+    this.#onError = options.onError ?? (() => undefined);
   }
 
   getStats(): ClsWriterStats {
     return { ...this.#stats };
   }
 
-  async putLogs(entries: readonly ClsLogEntry[]): Promise<void> {
-    if (entries.length === 0) return;
-    const batches = partitionEntries(entries, this.#maxBatchBytes);
-    for (const batch of batches) await this.#uploadBatch(batch);
+  putLogs(entries: readonly ClsLogEntry[]): Promise<void> {
+    if (entries.length === 0) return Promise.resolve();
+    if (this.#closing) return Promise.reject(new Error("CLS writer is shutting down"));
+    const operation = this.#queue.then(() => this.#putLogsNow(entries));
+    this.#queue = operation.catch(() => undefined);
+    return operation;
   }
 
-  async #uploadBatch(entries: readonly ClsLogEntry[]): Promise<void> {
-    const payload = encodeLogGroupList(entries);
+  async flush(): Promise<void> {
+    await this.#queue;
+  }
+
+  async shutdown(): Promise<void> {
+    this.#closing = true;
+    await this.#queue;
+  }
+
+  async #putLogsNow(entries: readonly ClsLogEntry[]): Promise<void> {
+    const partitioned = partitionEntries(entries, this.#maxBatchBytes);
+    if (partitioned.droppedOversizedSpans > 0) {
+      this.#stats.droppedOversizedSpans += partitioned.droppedOversizedSpans;
+      this.#onError(
+        new Error(`CLS dropped ${partitioned.droppedOversizedSpans} oversized span(s)`),
+      );
+    }
+    const retryBudget = Math.min(
+      30_000,
+      this.#maxRetryDelayMs * Math.max(1, this.#maxRetries),
+    );
+    const deadline = Date.now() + this.#requestTimeoutMs * (this.#maxRetries + 1) + retryBudget;
+    for (let index = 0; index < partitioned.payloads.length; index += 1) {
+      await this.#uploadBatch(
+        partitioned.payloads[index]!,
+        partitioned.spanCounts[index]!,
+        deadline,
+      );
+    }
+  }
+
+  async #uploadBatch(payload: Buffer, spanCount: number, deadline: number): Promise<void> {
     let lastError: unknown;
     for (let attempt = 0; attempt <= this.#maxRetries; attempt++) {
       try {
-        await this.#attempt(payload);
-        this.#stats.uploadedSpans += entries.length;
+        const remainingMs = Math.max(1, deadline - Date.now());
+        await this.#attempt(payload, Math.min(this.#requestTimeoutMs, remainingMs));
+        this.#stats.uploadedSpans += spanCount;
         this.#stats.lastSuccessAtMs = Date.now();
         return;
       } catch (error) {
@@ -242,8 +332,11 @@ export class ClsWriter {
           break;
         }
         this.#stats.retryAttempts += 1;
-        const delay = error.retryAfterMs ?? Math.round(500 * 2 ** attempt * (0.8 + Math.random() * 0.4));
-        await sleep(delay);
+        const requestedDelay =
+          error.retryAfterMs ?? Math.round(500 * 2 ** attempt * (0.8 + Math.random() * 0.4));
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) break;
+        await sleep(Math.min(requestedDelay, this.#maxRetryDelayMs, remainingMs));
       }
     }
     this.#stats.failedBatches += 1;
@@ -252,7 +345,7 @@ export class ClsWriter {
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
 
-  async #attempt(payload: Buffer): Promise<void> {
+  async #attempt(payload: Buffer, timeoutMs: number): Promise<void> {
     const timestampSeconds = Math.floor(Date.now() / 1_000);
     const headers: Record<string, string> = {
       "Content-Type": CONTENT_TYPE,
@@ -281,20 +374,26 @@ export class ClsWriter {
         method: "POST",
         headers,
         body: payload,
-        signal: AbortSignal.timeout(this.#requestTimeoutMs),
+        redirect: "error",
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (/timeout|abort/i.test(message)) {
         throw new ClsUploadError(
-          `CLS UploadLog request timeout after ${this.#requestTimeoutMs}ms`,
+          `CLS UploadLog request timeout after ${timeoutMs}ms`,
           true,
         );
       }
       throw new ClsUploadError(`CLS UploadLog network error: ${message}`, true);
     }
 
-    const body = (await response.text()).slice(0, 64 * 1024);
+    let body: string;
+    try {
+      body = await readResponseText(response);
+    } catch {
+      throw new ClsUploadError("CLS UploadLog response stream failed", true);
+    }
     let apiError: { Code?: string; Message?: string } | undefined;
     if (body.trim().length > 0) {
       try {
@@ -311,8 +410,9 @@ export class ClsWriter {
     if (apiError !== undefined) {
       const code = apiError.Code ?? "UnknownError";
       throw new ClsUploadError(
-        `CLS UploadLog ${code}: ${apiError.Message ?? "unknown error"}`,
-        isRetryableApiCode(code),
+        `CLS UploadLog ${code} (HTTP ${response.status})`,
+        isRetryableStatus(response.status) || isRetryableApiCode(code),
+        parseRetryAfter(response.headers.get("retry-after")),
       );
     }
     if (!response.ok) {

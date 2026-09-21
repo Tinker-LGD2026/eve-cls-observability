@@ -56,7 +56,7 @@ npm install eve-cls-observability
 # 或 pnpm add eve-cls-observability / yarn add eve-cls-observability
 ```
 
-要求 Node.js >= 24，eve >= 0.56（eve 是本插件的 peer dependency，你的项目应该已经装了）。
+要求 Node.js >= 24，eve >= 0.56.0 且 < 0.57.0（eve 是本插件的 peer dependency，你的项目应该已经安装）。
 
 ### 第 2 步：在 CLS 控制台创建 Agent 可观测应用
 
@@ -120,7 +120,7 @@ CLS_OBS_DEBUG=1 npm run dev
 
 ```
 你的 agent 业务代码（零改动）
-  → eve 框架生命周期事件（session / turn / step / model.call / tool.call 等 18 类）
+  → eve 框架生命周期事件（session / turn / step / model.call / tool.call 等）
   → 本插件：span 状态机按 CLS Agent Trace 规范组装五层 span 树
   → 独立 TracerProvider（不注册全局，对你的应用零干扰）
   → BatchSpanProcessor（后台批量导出，默认 2 秒一批）
@@ -139,7 +139,11 @@ CLS_OBS_DEBUG=1 npm run dev
 | step 尝试开始/结束 | `step`（ReAct 轮次） | `react round_{N}` | `step.id`、轮次号、`finish_reason` |
 | model.call 开始/结束 | `chat`（模型调用） | `chat {model}` | 模型名、输入/输出消息、token usage、耗时 |
 | tool.call 开始/结束 | `tool`（工具调用） | `execute_tool {name}` | 工具名、入参、结果、耗时、错误分类 |
+| eve durable 编排窗口 | `chain`（CLS 兼容扩展） | `chain eve.{phase}` | `operation.name=eve.orchestration`、`chain.name=eve.session_init/eve.durable_orchestration` |
+| 晚到的 durable action 终态 | `chain`（CLS 兼容扩展） | `chain eve.action.{outcome}` | `operation.name=eve.action`、`chain.name=eve.action.completed/rejected/...` |
 | 子 agent 派发 | `tool` + 子树 | `invoke_subagent` | 子 agent 的完整调用链嵌套在派发它的 tool span 下 |
+
+> `gen_ai.span.kind` 和 `chain` 是 CLS 的兼容分类，不是 OpenTelemetry GenAI 官方属性/操作。OpenTelemetry 允许在没有适用 well-known value 时使用自定义 operation，因此插件对 eve 内部编排使用带命名空间的 `eve.orchestration` / `eve.action`，避免冒充官方 `invoke_workflow`（后者只适用于用户定义的可组合工作流）。
 
 span 之间通过 ID 链关联：`turn.id = {sessionId}:t{N}`、`step.id = {turnId}:s{N}`，控制台上因此能还原出完整的树状时间线。属性命名遵循 `gen_ai.*` 协议命名空间（OpenTelemetry GenAI 语义约定），eve 框架的扩展信息放在 `agent.eve.*` 下（如 `agent.eve.turn.sequence`、`agent.eve.channel.type`）。
 
@@ -155,7 +159,7 @@ span 之间通过 ID 链关联：`turn.id = {sessionId}:t{N}`、`step.id = {turn
 | `region` | `CLS_REGION` | 主题所属地域，如 `ap-shanghai` |
 | `secretId` / `secretKey` | `CLS_SECRET_ID` / `CLS_SECRET_KEY` | 腾讯云密钥（建议最小权限子账号） |
 | `token` | `CLS_TOKEN` | 可选，STS 临时密钥的 session token |
-| `apiHost` | `CLS_API_HOST` | API 域名覆盖，默认 `cls.{region}.tencentcloudapi.com`；自定义域名需同时设 `allowCustomEndpoint: true`（SSRF 防护，见下） |
+| `apiHost` | `CLS_API_HOST` | 仅兼容历史配置；只接受官方地域域名 `cls.{region}.tencentcloudapi.com`，不支持自定义目标 |
 
 ### 服务标识（在 CLS 控制台区分你的应用）
 
@@ -186,7 +190,7 @@ span 之间通过 ID 链关联：`turn.id = {sessionId}:t{N}`、`step.id = {turn
 | `requestTimeoutMs` | `10000` | 单次上报请求超时（100–60000 ms） |
 | `maxRetries` | `2` | 失败后的指数退避重试次数（0–10） |
 | `maxBatchBytes` | `4.5 MiB` | 单个上报请求的字节上限（CLS 硬限制 5 MiB，超出自动分包） |
-| `maxTrackedSessions` | `1000` | 内存中跟踪的会话状态上限（LRU 淘汰） |
+| `maxTrackedSessions` | `1000` | 内存中跟踪的会话状态上限（超限淘汰最早状态） |
 | `stateTtlMs` | `30 min` | 空闲会话状态的过期时间 |
 | `messageDelta` | `true` | 会话消息增量上报（首次全量 + md5 校验，前缀扩展后只发增量，断裂自动回落全量）；设为 `false` 则每次全量 |
 | `debug` | `false` | 诊断日志（也可用 `CLS_OBS_DEBUG=1`） |
@@ -227,7 +231,7 @@ export default clsObservability({
 });
 ```
 
-自定义（非腾讯云官方）endpoint 必须显式 `allowCustomEndpoint: true` 且使用 HTTPS——这是 SSRF 防护设计，防止配置错误把 trace 数据发往意外目的地。
+镜像只允许腾讯云官方地域 endpoint `https://{region}.cls.tencentcs.com/v1/traces`。为防止 SSRF 和凭据误发，不支持自定义 endpoint；当宿主配置了全局 `OTEL_EXPORTER_OTLP*_HEADERS` 时也会拒绝启用镜像。
 
 ### 服务标识与环境区分
 
@@ -241,7 +245,7 @@ export default clsObservability({
 });
 ```
 
-之后可在 CLS 检索中按 `resource.service.name`、`resource.deployment.environment` 过滤。
+之后可在 CLS 的 `resource` JSON 中按 `service.name`、`deployment.environment.name` 过滤。
 
 ## 内容采集与隐私
 
@@ -268,7 +272,8 @@ export default clsObservability({
 | 你的环境 | 要做的操作 |
 |---|---|
 | 本地开发（`eve dev`） | **无需操作**——`eve dev` 自动按 development 环境放行 |
-| Vercel preview / development | **无需操作**——非 production 自动放行 |
+| Vercel development | **无需操作**——development 环境自动放行 |
+| Vercel preview | 会话 `audience` 设为 `"public"`；preview 不会自动放行正文 |
 | 自托管生产（物理机 / 虚机 / 容器 / K8s） | 在 `agent/channels/` 的会话配置中把 `audience` 设为 `"public"` |
 | Vercel production | 同上：会话 `audience` 设为 `"public"` |
 
@@ -291,7 +296,7 @@ eve 应用的生产形态：`eve build` 产出标准 Nitro server（`.output/` �
 - **密钥不进代码、不进镜像**：运行时注入环境变量，优先级为代码传参 > 环境变量
 - **启动即校验**：必填配置缺失、格式错误会在 `clsObservability()` 调用时直接抛错——宁可启动时明确失败，也不要上线后才发现一直没数据
 - **退出无需手写清理**：进程退出时 eve 框架自动调用插件的 `flush`/`shutdown` 生命周期排空缓冲
-- **内存有界**：`maxTrackedSessions`（默认 1000，LRU 淘汰）+ `stateTtlMs`（默认 30 分钟）双重约束，长跑服务不会因状态累积涨内存
+- **内存有界**：`maxTrackedSessions`（默认 1000，超限淘汰）+ `stateTtlMs`（默认 30 分钟）双重约束；丢失终态事件的活动 turn 会按 `abandoned` 结束并释放
 
 ### 物理机 / 虚拟机（systemd）
 
@@ -423,7 +428,7 @@ spec:
             httpGet: { path: /, port: 3000 }
 ```
 
-**多副本无需特殊处理**：span 状态在进程内维护（LRU + TTL 上限），同一会话被路由到不同副本时会自然开始新的 span 上下文，不影响 CLS 侧按 `session.id` 检索聚合，**不需要 sticky session**。
+**多副本一般无需 sticky session**：状态在进程内且有容量/TTL 上限；durable 调用跨实例恢复时，恢复 span 会挂到当前实例重建的 step/agent，并用 span link 保留旧上下文。CLS 仍可按 `session.id` 聚合，但跨实例的消息增量可能回退为全量。
 
 ### Vercel（Serverless）
 
@@ -431,17 +436,17 @@ spec:
 
 - 4 个 `CLS_*` 变量配在 Vercel 项目的 Environment Variables（Production / Preview 分开配置）
 - Serverless 没有可靠的"进程退出"时机，但 eve 会在**每个 turn / 会话结束时自动调用插件 flush**，数据不会因实例冻结而滞留——这是框架托管生命周期的价值，你无需任何额外代码
-- 内容采集的环境判定按 `VERCEL_ENV` 进行：`production` 环境下只有 public audience 会话放行正文（见[内容采集与隐私](#内容采集与隐私)）
+- 内容采集按 `VERCEL_ENV` 和 audience 判定：只有 `development` 或 `audience="public"` 放行正文；preview/production 的非 public 会话均不采集（见[内容采集与隐私](#内容采集与隐私)）
 
 ### 网络与出网要求
 
 | 项 | 值 |
 |---|---|
-| 目的地址 | `cls.{region}.tencentcloudapi.com`（可用 `apiHost` 覆盖） |
+| 目的地址 | `cls.{region}.tencentcloudapi.com`（只允许官方地域域名） |
 | 端口 / 协议 | 443 / HTTPS（TC3 签名在应用层完成，传输本身也是 TLS） |
 | 方向 | **仅出向（egress）**，不需要任何入向端口、公网 IP 或安全组放行 |
 | 腾讯云 VPC 内 | 该域名可经 PrivateDNS 解析到内网接入点，无需改配置、免公网流量费 |
-| 专有云 / 自建接入点 | 用 `apiHost` + `allowCustomEndpoint: true`（先过 SSRF 评审，见配置章节） |
+| 专有云 / 自建接入点 | 当前版本不支持自定义上报目标；请通过受控网络代理解析官方域名，或单独注册其他 eve instrumentation provider |
 
 **关于 STS 临时密钥**：插件在 `clsObservability()` 调用时（进程启动）读取一次 `CLS_TOKEN`，长驻进程不会自动刷新。使用 STS 的场景请配合滚动重启/重新部署刷新凭据；长驻物理机 / 虚拟机 / 容器更推荐 CAM 子账号长期密钥（最小权限 `cls:PushLog`）。
 
@@ -458,6 +463,7 @@ spec:
 ## 兼容性
 
 - **Node.js**：>= 24（与 eve 框架的运行时要求一致）
+- **模块格式**：ESM-only，请使用 `import`，不支持 CommonJS `require()`
 - **eve**：>= 0.56.0 < 0.57.0（peer dependency；eve 的 instrumentation API 尚处 experimental，跨 minor 版本可能有变动，故锁定小版本区间）
 - **与其他 instrumentation provider 共存**：`agent/instrumentation/` 目录可放多个 provider 文件，事件分发互不影响
 - **与既有 OpenTelemetry 体系共存**：本插件用独立 provider 写 CLS；如需同时写你自己的 OTel Collector，用 [OTLP 镜像](#otlp-镜像双写)或在 eve 中再注册一个标准 OTel provider
@@ -487,9 +493,9 @@ spec:
 
 4 个必填项（`topicId`/`region`/`secretId`/`secretKey`）有缺失或为空字符串。注意：如果你用 `.env` 文件，确认加载工具（如 dotenv）真的把变量写进了 `process.env`——某些配置库只读文件不注入环境。
 
-### 启动时报 `custom apiHost requires allowCustomEndpoint`
+### 启动时报 `custom apiHost is not supported`
 
-你覆盖了 `apiHost` 或 OTLP endpoint 且不是腾讯云官方域名。这是 SSRF 防护：确认目标地址可信后显式加 `allowCustomEndpoint: true`。指向私网/本地地址（`127.*`、`10.*`、`192.168.*` 等）会被直接拒绝且无法放开。
+当前版本只允许腾讯云官方地域 endpoint，不能通过 `allowCustomEndpoint` 放开自定义目标。删除 `CLS_API_HOST` / 自定义 mirror endpoint，确认 `region` 与主题地域一致；如需发往其他系统，请注册独立的 eve instrumentation provider。
 
 ### 调用链重复或断裂
 

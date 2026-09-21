@@ -9,7 +9,7 @@ export interface OtlpMirrorOptions {
   readonly endpoint?: string;
   /** Mirror-specific headers. Main CLS credentials are never inherited. */
   readonly headers?: Readonly<Record<string, string>>;
-  /** Required for non-Tencent endpoints after the SSRF implications are reviewed. */
+  /** @deprecated Custom OTLP endpoints are rejected since v0.2.0. */
   readonly allowCustomEndpoint?: boolean;
 }
 
@@ -22,7 +22,7 @@ export interface ClsObservabilityOptions {
   /** Optional STS session token. Falls back to `CLS_TOKEN`. */
   readonly token?: string;
   readonly apiHost?: string;
-  /** Required when apiHost is not the official regional CLS OpenAPI host. */
+  /** @deprecated Custom UploadLog endpoints are rejected since v0.2.0. */
   readonly allowCustomEndpoint?: boolean;
   readonly agentType?: string;
   readonly serviceName?: string;
@@ -119,20 +119,10 @@ function officialApiHost(region: string): string {
   return `cls.${region}.tencentcloudapi.com`;
 }
 
-function isPrivateAddress(host: string): boolean {
-  return /^(?:localhost|127\.|0\.|10\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|\[?::1\]?)$/i.test(host);
-}
-
-function validateApiHost(host: string, region: string, allowCustom: boolean): void {
-  if (/^https?:\/\//i.test(host) || host.includes("/") || host.includes("@")) {
-    throw new Error("eve-cls-observability: apiHost must be a hostname without scheme or path");
-  }
-  if (isPrivateAddress(host)) {
-    throw new Error("eve-cls-observability: apiHost must not target local or private networks");
-  }
-  if (host !== officialApiHost(region) && !allowCustom) {
+function validateApiHost(host: string, region: string, _allowCustom: boolean): void {
+  if (host !== officialApiHost(region)) {
     throw new Error(
-      "eve-cls-observability: custom apiHost requires allowCustomEndpoint=true after SSRF review",
+      "eve-cls-observability: custom apiHost is not supported; use the official regional CLS OpenAPI host",
     );
   }
 }
@@ -149,19 +139,38 @@ function resolveMirror(mirror: OtlpMirrorOptions, defaultRegion: string): Resolv
   } catch {
     throw new Error("eve-cls-observability: OTLP mirror endpoint must be a valid HTTPS URL");
   }
-  const official = url.protocol === "https:" && /^([a-z0-9-]+\.)?cls\.tencentcs\.com$/i.test(url.hostname);
-  if (url.protocol !== "https:") {
-    throw new Error("eve-cls-observability: OTLP mirror endpoint must use HTTPS");
-  }
-  if ((!official || url.pathname !== "/v1/traces") && mirror.allowCustomEndpoint !== true) {
+  const official =
+    url.protocol === "https:" &&
+    url.hostname === `${region}.cls.tencentcs.com` &&
+    url.port === "" &&
+    url.pathname === "/v1/traces" &&
+    url.search === "" &&
+    url.hash === "" &&
+    url.username === "" &&
+    url.password === "";
+  if (!official) {
     throw new Error(
-      "eve-cls-observability: custom OTLP endpoint requires allowCustomEndpoint=true and independent auth",
+      "eve-cls-observability: custom OTLP endpoint is not supported; use the official regional CLS endpoint",
+    );
+  }
+  const reservedHeaders = new Set(["topic_id", "host", "content-length", "content-type"]);
+  for (const key of Object.keys(mirror.headers ?? {})) {
+    if (reservedHeaders.has(key.toLowerCase())) {
+      throw new Error(`eve-cls-observability: OTLP mirror reserved header cannot be overridden: ${key}`);
+    }
+  }
+  if (
+    process.env.OTEL_EXPORTER_OTLP_HEADERS !== undefined ||
+    process.env.OTEL_EXPORTER_OTLP_TRACES_HEADERS !== undefined
+  ) {
+    throw new Error(
+      "eve-cls-observability: OTLP mirror cannot be used while global OTLP headers are configured",
     );
   }
   return {
     topicId,
     endpoint: url.toString(),
-    headers: { topic_id: topicId, ...(mirror.headers ?? {}) },
+    headers: { ...(mirror.headers ?? {}), topic_id: topicId },
   };
 }
 

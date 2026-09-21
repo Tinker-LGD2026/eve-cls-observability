@@ -39,6 +39,7 @@ import {
   messagesAttribute,
   usageAttributes,
   usageFromEvent,
+  type ErrorInfo,
 } from "./assembler.js";
 import type { ResolvedConfig } from "./config.js";
 import type { SpanPipeline } from "./exporter.js";
@@ -53,12 +54,29 @@ import {
   type ClsMessage,
 } from "./messages.js";
 
-interface UsageTotals {
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheWriteTokens: number;
+interface UsageAggregate {
+  sum: number;
+  observed: number;
+  missing: number;
 }
+
+interface UsageTotals {
+  readonly inputTokens: UsageAggregate;
+  readonly outputTokens: UsageAggregate;
+  readonly cacheReadTokens: UsageAggregate;
+  readonly cacheWriteTokens: UsageAggregate;
+}
+
+interface TerminalError {
+  readonly type: string;
+  readonly message?: string;
+}
+
+type TurnOutcome =
+  | { readonly kind: "completed" }
+  | { readonly kind: "cancelled" }
+  | { readonly kind: "failed"; readonly error?: ErrorInfo }
+  | { readonly kind: "abandoned"; readonly error: TerminalError };
 
 interface TurnState {
   /** Eve runtime session id used for map lookup. */
@@ -71,6 +89,7 @@ interface TurnState {
   readonly agentSpan: Span;
   readonly startMs: number;
   readonly sequence: number;
+  updatedAtMs: number;
   inputBackfilled: boolean;
   messageCount: number;
   toolCallCount: number;
@@ -96,10 +115,12 @@ interface StepState {
 interface ChildSpanState {
   readonly span: Span;
   readonly startMs: number;
+  readonly attemptId?: string;
   readonly stepKey?: string;
   readonly turnKey: string;
   readonly name?: string;
   readonly callId?: string;
+  readonly actionKey?: string;
 }
 
 /** JSON-safe correlation state persisted through eve provider ctx.state. */
@@ -114,7 +135,11 @@ export interface DurableChildSnapshot {
   readonly attributes: Readonly<Record<string, string | number | boolean | readonly string[]>>;
   readonly stepKey: string;
   readonly turnKey: string;
+  readonly sessionId?: string;
+  readonly turnId?: string;
+  readonly attemptId?: string;
   readonly toolName?: string;
+  readonly callId?: string;
 }
 
 const EVE_FRAMEWORK_VERSION = ((): string | undefined => {
@@ -136,6 +161,7 @@ interface SubagentInfo {
 }
 
 interface SessionInfo {
+  updatedAtMs: number;
   readonly agentName?: string;
   readonly channelKind?: string;
   readonly channelType?: string;
@@ -151,6 +177,15 @@ function turnKeyOf(sessionId: string, turnId: string): string {
 
 function stepKeyOf(sessionId: string, turnId: string, stepIndex: number): string {
   return `${sessionId}|${turnId}|${stepIndex}`;
+}
+
+function actionKeyOf(sessionId: string, turnId: string, callId: string): string {
+  return `action:${sessionId}:${turnId}:${callId}`;
+}
+
+function modelCallSequence(idempotencyKey: string): number {
+  const value = Number(idempotencyKey.split(":").at(-1));
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
 /** Maps an eve channel kind onto the CLS entry-type vocabulary. */
@@ -183,6 +218,36 @@ function readGatewayCosts(
   return result;
 }
 
+function usageAggregate(): UsageAggregate {
+  return { sum: 0, observed: 0, missing: 0 };
+}
+
+function usageTotals(): UsageTotals {
+  return {
+    inputTokens: usageAggregate(),
+    outputTokens: usageAggregate(),
+    cacheReadTokens: usageAggregate(),
+    cacheWriteTokens: usageAggregate(),
+  };
+}
+
+function recordUsage(target: UsageAggregate, value: number | undefined): void {
+  if (value === undefined) {
+    target.missing += 1;
+    return;
+  }
+  target.sum += value;
+  target.observed += 1;
+}
+
+function observedUsage(target: UsageAggregate): number | undefined {
+  return target.observed > 0 ? target.sum : undefined;
+}
+
+function hasPartialUsage(usage: UsageTotals): boolean {
+  return Object.values(usage).some((field) => field.observed > 0 && field.missing > 0);
+}
+
 /**
  * Span state machine: consumes eve instrumentation lifecycle events and
  * maintains the CLS span tree (entry → agent → step → chat/tool).
@@ -195,6 +260,21 @@ export class ClsSpanStore {
   readonly #steps = new Map<string, StepState>();
   readonly #chats = new Map<string, ChildSpanState>();
   readonly #tools = new Map<string, ChildSpanState>();
+  readonly #toolByActionKey = new Map<string, string>();
+  readonly #pendingActionAttributes = new Map<string, Attributes>();
+  readonly #closedActionParents = new Map<
+    string,
+    {
+      traceId: string;
+      spanId: string;
+      traceFlags: number;
+      createdAtMs: number;
+      sessionId: string;
+      turnId: string;
+      stepId: string;
+      callId: string;
+    }
+  >();
   readonly #sessionTurns = new Map<string, Set<string>>();
   readonly #sessions = new Map<string, SessionInfo>();
   /** Content-free, TTL/LRU-bounded cursor for messages_delta. */
@@ -225,6 +305,7 @@ export class ClsSpanStore {
     // Per-turn trace model: sessions emit no span, but their channel and
     // identity context enriches every entry/agent span of their turns.
     this.#sessions.set(event.sessionId, {
+      updatedAtMs: Date.now(),
       ...(event.agentName !== undefined ? { agentName: event.agentName } : {}),
       ...(event.channelKind !== undefined ? { channelKind: event.channelKind } : {}),
       ...(event.channelType !== undefined ? { channelType: event.channelType } : {}),
@@ -246,10 +327,11 @@ export class ClsSpanStore {
           }
         : {}),
     });
+    this.#evictStaleState();
   }
 
   onSessionSettled(event: InstrumentationSessionSettledEvent): PromiseLike<void> {
-    return this.#closeSession(event.sessionId, undefined);
+    return this.#closeSession(event.sessionId, { kind: "completed" });
   }
 
   onSessionWaiting(_event: InstrumentationSessionSettledEvent): void {
@@ -259,12 +341,13 @@ export class ClsSpanStore {
 
   onSessionFailed(event: InstrumentationSessionFailedEvent): PromiseLike<void> {
     const error = event.error !== undefined ? extractError(event.error) : undefined;
-    return this.#closeSession(event.sessionId, error);
+    return this.#closeSession(event.sessionId, { kind: "failed", error });
   }
 
   // ------------------------------------------------------------------- turn
 
   onTurnStarted(event: InstrumentationTurnStartedEvent): void {
+    this.#evictStaleState();
     const key = turnKeyOf(event.sessionId, event.turnId);
     if (this.#turns.has(key)) return; // durable replay idempotency
     const now = Date.now();
@@ -412,11 +495,12 @@ export class ClsSpanStore {
       agentSpan,
       startMs: now,
       sequence: event.sequence + 1,
+      updatedAtMs: now,
       inputBackfilled: false,
       messageCount: 0,
       toolCallCount: 0,
       costUsd: 0,
-      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      usage: usageTotals(),
     };
     state.pendingChain = this.#openChain(state, "session_init", now);
     this.#turns.set(key, state);
@@ -424,17 +508,20 @@ export class ClsSpanStore {
   }
 
   onTurnSettled(event: InstrumentationTurnSettledEvent): void {
-    this.#closeTurn(turnKeyOf(event.sessionId, event.turnId), undefined);
+    this.#closeTurn(turnKeyOf(event.sessionId, event.turnId), {
+      kind: event.type === "turn.cancelled" ? "cancelled" : "completed",
+    });
   }
 
   onTurnFailed(event: InstrumentationTurnFailedEvent): void {
     const error = event.error !== undefined ? extractError(event.error) : undefined;
-    this.#closeTurn(turnKeyOf(event.sessionId, event.turnId), error);
+    this.#closeTurn(turnKeyOf(event.sessionId, event.turnId), { kind: "failed", error });
   }
 
   // ------------------------------------------------------------------- step
 
   onStepStarted(event: InstrumentationStepAttemptStartedEvent): void {
+    this.#maintainActiveState(event.scope.sessionId, event.scope.turnId);
     const turn = this.#turns.get(turnKeyOf(event.scope.sessionId, event.scope.turnId));
     if (turn === undefined) return;
     this.#closeChain(turn); // orchestration window ends where real work resumes
@@ -475,44 +562,73 @@ export class ClsSpanStore {
   }
 
   onStepCompleted(event: InstrumentationStepAttemptCompletedEvent): void {
-    this.#closeStep(
+    this.#closeAttemptChildren(event.scope.attemptId, {
+      type: "IncompleteCall",
+      message: "step attempt completed before child call settled",
+    });
+    const closed = this.#closeStep(
       stepKeyOf(event.scope.sessionId, event.scope.turnId, event.scope.stepIndex),
       undefined,
     );
     const turn = this.#turns.get(turnKeyOf(event.scope.sessionId, event.scope.turnId));
-    if (turn !== undefined) {
+    if (closed && turn !== undefined) {
+      this.#closeChain(turn);
       turn.pendingChain = this.#openChain(turn, "durable_orchestration", Date.now());
     }
   }
 
   onActionStarted(event: InstrumentationActionStartedEvent): void {
-    const tool = this.#tools.get(`tool:${event.scope.sessionId}:${event.scope.turnId}:${event.callId}`);
-    tool?.span.addEvent("action.started", {
+    this.#maintainActiveState(event.scope.sessionId, event.scope.turnId);
+    const attributes: Attributes = {
       "agent.eve.action.kind": event.kind,
       "agent.eve.action.workflow": event.isWorkflowTool === true,
-    });
+    };
+    const toolKey = this.#toolByActionKey.get(event.idempotencyKey);
+    const tool = toolKey !== undefined ? this.#tools.get(toolKey) : undefined;
+    if (tool !== undefined) {
+      tool.span.addEvent("action.started", attributes);
+    } else {
+      this.#pendingActionAttributes.set(event.idempotencyKey, attributes);
+    }
   }
 
   onActionCompleted(event: InstrumentationActionCompletedEvent): void {
-    this.#annotateAction(event.scope.sessionId, event.scope.turnId, event.idempotencyKey, {
-      "agent.eve.action.outcome": event.outcome,
-      ...(event.acceptedAtMs !== undefined
-        ? { "agent.eve.action.accepted_at_ms": event.acceptedAtMs }
-        : {}),
-    });
+    this.#maintainActiveState(event.scope.sessionId, event.scope.turnId);
+    this.#annotateAction(
+      event.scope.sessionId,
+      event.scope.turnId,
+      event.scope.stepIndex,
+      event.idempotencyKey,
+      {
+        "agent.eve.action.outcome": event.outcome,
+        ...(event.acceptedAtMs !== undefined
+          ? { "agent.eve.action.accepted_at_ms": event.acceptedAtMs }
+          : {}),
+      },
+    );
   }
 
   onActionFailed(event: InstrumentationActionFailedEvent): void {
-    this.#annotateAction(event.scope.sessionId, event.scope.turnId, event.idempotencyKey, {
-      "agent.eve.action.outcome": event.outcome,
-      ...(event.errorCode !== undefined ? { "agent.eve.action.error_code": event.errorCode } : {}),
-      ...(event.acceptedAtMs !== undefined
-        ? { "agent.eve.action.accepted_at_ms": event.acceptedAtMs }
-        : {}),
-    });
+    this.#maintainActiveState(event.scope.sessionId, event.scope.turnId);
+    this.#annotateAction(
+      event.scope.sessionId,
+      event.scope.turnId,
+      event.scope.stepIndex,
+      event.idempotencyKey,
+      {
+        "agent.eve.action.outcome": event.outcome,
+        ...(event.errorCode !== undefined
+          ? { "agent.eve.action.error_code": event.errorCode }
+          : {}),
+        ...(event.acceptedAtMs !== undefined
+          ? { "agent.eve.action.accepted_at_ms": event.acceptedAtMs }
+          : {}),
+      },
+    );
   }
 
   onInputRequested(event: InstrumentationInputRequestedEvent): void {
+    this.#maintainActiveState(event.scope.sessionId, event.scope.turnId);
     const step = this.#steps.get(
       stepKeyOf(event.scope.sessionId, event.scope.turnId, event.scope.stepIndex),
     );
@@ -523,6 +639,7 @@ export class ClsSpanStore {
   }
 
   onInputResolved(event: InstrumentationInputResolvedEvent): void {
+    this.#maintainActiveState(event.scope.sessionId, event.scope.turnId);
     const step = this.#steps.get(
       stepKeyOf(event.scope.sessionId, event.scope.turnId, event.scope.stepIndex),
     );
@@ -534,7 +651,12 @@ export class ClsSpanStore {
   }
 
   onStepFailed(event: InstrumentationStepAttemptFailedEvent): void {
+    this.#maintainActiveState(event.scope.sessionId, event.scope.turnId);
     const error = event.error !== undefined ? extractError(event.error) : undefined;
+    this.#closeAttemptChildren(
+      event.scope.attemptId,
+      error ?? { type: "StepAttemptFailed", message: "step attempt failed" },
+    );
     const step = this.#steps.get(
       stepKeyOf(event.scope.sessionId, event.scope.turnId, event.scope.stepIndex),
     );
@@ -551,6 +673,7 @@ export class ClsSpanStore {
   }
 
   onStepAttemptMetadata(event: InstrumentationStepAttemptMetadataEvent): void {
+    this.#maintainActiveState(event.scope.sessionId, event.scope.turnId);
     // AI Gateway cost rides provider metadata; DeepSeek/direct providers
     // simply carry none. Costs aggregate onto the agent span at turn close.
     const costs = readGatewayCosts(event.providerMetadata);
@@ -569,10 +692,12 @@ export class ClsSpanStore {
   onModelCallStarted(
     event: InstrumentationModelCallStartedEvent,
   ): DurableChildSnapshot | undefined {
+    this.#maintainActiveState(event.scope.sessionId, event.scope.turnId);
     const existing = this.#chats.get(event.idempotencyKey);
     if (existing !== undefined) return undefined;
     const turn = this.#turns.get(turnKeyOf(event.scope.sessionId, event.scope.turnId));
     if (turn === undefined) return undefined;
+    turn.updatedAtMs = Date.now();
     const stepKey = stepKeyOf(event.scope.sessionId, event.scope.turnId, event.scope.stepIndex);
     const step = this.#steps.get(stepKey);
     const round = event.scope.stepIndex + 1;
@@ -601,7 +726,10 @@ export class ClsSpanStore {
       }
       const messages = clsInputMessages(event.input.messages, this.#config.recordReasoning);
       const cursorVersion =
-        turn.sequence * 1_000_000 + event.scope.stepIndex * 100 + event.scope.attemptIndex;
+        turn.sequence * 1_000_000_000 +
+        event.scope.stepIndex * 1_000_000 +
+        event.scope.attemptIndex * 1_000 +
+        modelCallSequence(event.idempotencyKey);
       Object.assign(
         attributes,
         this.#inputMessagesAttribute(event.scope.sessionId, messages, cursorVersion),
@@ -629,6 +757,7 @@ export class ClsSpanStore {
     this.#chats.set(event.idempotencyKey, {
       span,
       startMs,
+      attemptId: event.scope.attemptId,
       stepKey,
       turnKey,
     });
@@ -644,6 +773,9 @@ export class ClsSpanStore {
       attributes: attributes as DurableChildSnapshot["attributes"],
       stepKey,
       turnKey,
+      sessionId: event.scope.sessionId,
+      turnId: event.scope.turnId,
+      attemptId: event.scope.attemptId,
     };
   }
 
@@ -651,6 +783,7 @@ export class ClsSpanStore {
     event: InstrumentationModelCallCompletedEvent,
     durable?: DurableChildSnapshot,
   ): void {
+    this.#maintainActiveState(event.scope.sessionId, event.scope.turnId);
     let state = this.#chats.get(event.idempotencyKey);
     if (state === undefined && durable?.operation === "model") {
       state = this.#recoverChild(event.idempotencyKey, durable, this.#chats);
@@ -679,19 +812,21 @@ export class ClsSpanStore {
       if (turn !== undefined) {
         this.#backfillEntryMessages(turn, "gen_ai.output.messages", [output]);
       }
-      const thought = event.content
-        .filter((part) => part.type === "reasoning")
-        .map((part) => part.text)
-        .filter((text) => text.trim().length > 0)
-        .join("\n");
-      if (thought.length > 0) {
-        const stepState = this.#steps.get(state.stepKey ?? "");
-        stepState?.span.setAttribute(
-          "gen_ai.react.thought",
-          thought.length <= this.#config.maxContentLength
-            ? thought
-            : `${thought.slice(0, this.#config.maxContentLength)}… [truncated]`,
-        );
+      if (this.#config.recordReasoning) {
+        const thought = event.content
+          .filter((part) => part.type === "reasoning")
+          .map((part) => part.text)
+          .filter((text) => text.trim().length > 0)
+          .join("\n");
+        if (thought.length > 0) {
+          const stepState = this.#steps.get(state.stepKey ?? "");
+          stepState?.span.setAttribute(
+            "gen_ai.react.thought",
+            thought.length <= this.#config.maxContentLength
+              ? thought
+              : `${thought.slice(0, this.#config.maxContentLength)}… [truncated]`,
+          );
+        }
       }
     }
     state.span.setAttributes(attributes as never);
@@ -706,10 +841,10 @@ export class ClsSpanStore {
     if (step !== undefined) step.lastFinishReason = finishReason;
     if (turn !== undefined) {
       turn.messageCount += 1;
-      turn.usage.inputTokens += event.usage.inputTokens ?? 0;
-      turn.usage.outputTokens += event.usage.outputTokens ?? 0;
-      turn.usage.cacheReadTokens += event.usage.inputTokenDetails?.cacheReadTokens ?? 0;
-      turn.usage.cacheWriteTokens += event.usage.inputTokenDetails?.cacheWriteTokens ?? 0;
+      recordUsage(turn.usage.inputTokens, event.usage.inputTokens);
+      recordUsage(turn.usage.outputTokens, event.usage.outputTokens);
+      recordUsage(turn.usage.cacheReadTokens, event.usage.inputTokenDetails?.cacheReadTokens);
+      recordUsage(turn.usage.cacheWriteTokens, event.usage.inputTokenDetails?.cacheWriteTokens);
     }
   }
 
@@ -717,6 +852,7 @@ export class ClsSpanStore {
     event: InstrumentationModelCallFailedEvent,
     durable?: DurableChildSnapshot,
   ): void {
+    this.#maintainActiveState(event.scope.sessionId, event.scope.turnId);
     let state = this.#chats.get(event.idempotencyKey);
     if (state === undefined && durable?.operation === "model") {
       state = this.#recoverChild(event.idempotencyKey, durable, this.#chats);
@@ -724,15 +860,15 @@ export class ClsSpanStore {
     if (state === undefined) return;
     this.#chats.delete(event.idempotencyKey);
     const error = event.error !== undefined ? extractError(event.error) : undefined;
-    if (error !== undefined && this.#config.recordOutputs) {
-      state.span.setAttributes({
-        "error.type": error.type,
-        "gen_ai.response.finish_reasons": ["error"],
-      } as never);
-      state.span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
-    } else {
-      state.span.setStatus({ code: SpanStatusCode.ERROR });
-    }
+    state.span.setAttributes({
+      "gen_ai.chat.duration_ms": Date.now() - state.startMs,
+      "gen_ai.response.finish_reasons": ["error"],
+      "error.type": error?.type ?? "ModelCallFailed",
+    } as never);
+    state.span.setStatus({
+      code: SpanStatusCode.ERROR,
+      ...(error !== undefined && this.#config.recordOutputs ? { message: error.message } : {}),
+    });
     state.span.end();
     const step = this.#steps.get(state.stepKey ?? "");
     if (step !== undefined) step.lastFinishReason = "error";
@@ -743,9 +879,11 @@ export class ClsSpanStore {
   onToolCallStarted(
     event: InstrumentationToolCallStartedEvent,
   ): DurableChildSnapshot | undefined {
+    this.#maintainActiveState(event.scope.sessionId, event.scope.turnId);
     if (this.#tools.has(event.idempotencyKey)) return undefined;
     const turn = this.#turns.get(turnKeyOf(event.scope.sessionId, event.scope.turnId));
     if (turn === undefined) return undefined;
+    turn.updatedAtMs = Date.now();
     const stepKey = stepKeyOf(event.scope.sessionId, event.scope.turnId, event.scope.stepIndex);
     const step = this.#steps.get(stepKey);
     const round = event.scope.stepIndex + 1;
@@ -775,6 +913,7 @@ export class ClsSpanStore {
       parent,
     );
     const spanContext = span.spanContext();
+    const actionKey = actionKeyOf(event.scope.sessionId, event.scope.turnId, event.callId);
     this.#toolSpanIndex.set(
       `${event.scope.sessionId}|${event.scope.turnId}|${event.callId}`,
       {
@@ -784,15 +923,24 @@ export class ClsSpanStore {
         createdAtMs: Date.now(),
       },
     );
+    this.#evictStaleState();
     const turnKey = turnKeyOf(turn.sessionId, turn.turnId);
     this.#tools.set(event.idempotencyKey, {
       span,
       startMs,
+      attemptId: event.scope.attemptId,
       stepKey,
       turnKey,
       name: event.toolName,
       callId: event.callId,
+      actionKey,
     });
+    this.#toolByActionKey.set(actionKey, event.idempotencyKey);
+    const pendingAction = this.#pendingActionAttributes.get(actionKey);
+    if (pendingAction !== undefined) {
+      span.addEvent("action.started", pendingAction);
+      this.#pendingActionAttributes.delete(actionKey);
+    }
     return {
       version: 1,
       operation: "tool",
@@ -804,7 +952,9 @@ export class ClsSpanStore {
       attributes: attributes as DurableChildSnapshot["attributes"],
       stepKey,
       turnKey,
+      attemptId: event.scope.attemptId,
       toolName: event.toolName,
+      callId: event.callId,
     };
   }
 
@@ -812,12 +962,14 @@ export class ClsSpanStore {
     event: InstrumentationToolCallCompletedEvent,
     durable?: DurableChildSnapshot,
   ): void {
+    this.#maintainActiveState(event.scope.sessionId, event.scope.turnId);
     let state = this.#tools.get(event.idempotencyKey);
     if (state === undefined && durable?.operation === "tool") {
       state = this.#recoverChild(event.idempotencyKey, durable, this.#tools);
     }
     if (state === undefined) return;
     this.#tools.delete(event.idempotencyKey);
+    this.#releaseActionIndex(state);
     // eve reports in-band tool failures as a completed call whose output is
     // `{ type: "error", ... }` rather than firing tool.call.failed.
     const failed =
@@ -829,12 +981,16 @@ export class ClsSpanStore {
         ? extractError(event.output.error)
         : undefined;
     const actualOutput = event.output.type === "result" ? event.output.output : undefined;
+    let normalizedOutput: unknown;
     const attributes: Record<string, unknown> = {
       "gen_ai.tool.call.duration_ms": Date.now() - state.startMs,
     };
     if (this.#config.recordOutputs && actualOutput !== undefined) {
       const json = cappedJson(actualOutput, this.#config.maxContentLength);
-      if (json !== undefined) attributes["gen_ai.tool.call.result"] = json;
+      if (json !== undefined) {
+        attributes["gen_ai.tool.call.result"] = json;
+        normalizedOutput = JSON.parse(json) as unknown;
+      }
     }
     if (failed) {
       attributes["gen_ai.tool.error.type"] = errorDetail?.type ?? "execution_error";
@@ -855,11 +1011,11 @@ export class ClsSpanStore {
     state.span.end();
     const step = this.#steps.get(state.stepKey ?? "");
     if (step !== undefined) {
-      step.observations.push(
-        failed
-          ? { tool: state.name ?? "unknown", error: errorDetail ?? "execution_error" }
-          : { tool: state.name ?? "unknown", output: actualOutput },
-      );
+      if (failed) {
+        step.observations.push({ tool: state.name ?? "unknown", error: errorDetail ?? "execution_error" });
+      } else if (normalizedOutput !== undefined) {
+        step.observations.push({ tool: state.name ?? "unknown", output: normalizedOutput });
+      }
     }
     const turn = this.#turns.get(state.turnKey);
     if (turn !== undefined) turn.toolCallCount += 1;
@@ -869,12 +1025,14 @@ export class ClsSpanStore {
     event: InstrumentationToolCallFailedEvent,
     durable?: DurableChildSnapshot,
   ): void {
+    this.#maintainActiveState(event.scope.sessionId, event.scope.turnId);
     let state = this.#tools.get(event.idempotencyKey);
     if (state === undefined && durable?.operation === "tool") {
       state = this.#recoverChild(event.idempotencyKey, durable, this.#tools);
     }
     if (state === undefined) return;
     this.#tools.delete(event.idempotencyKey);
+    this.#releaseActionIndex(state);
     const error = event.error !== undefined ? extractError(event.error) : undefined;
     state.span.setAttributes({
       "gen_ai.tool.call.duration_ms": Date.now() - state.startMs,
@@ -902,8 +1060,11 @@ export class ClsSpanStore {
   // ----------------------------------------------------------------- closes
 
   async shutdown(): Promise<void> {
-    const abandoned = { type: "Abandoned", message: "provider shutdown before turn settled" };
-    for (const key of [...this.#turns.keys()]) this.#closeTurn(key, abandoned);
+    const outcome: TurnOutcome = {
+      kind: "abandoned",
+      error: { type: "Abandoned", message: "provider shutdown before turn settled" },
+    };
+    for (const key of [...this.#turns.keys()]) this.#closeTurn(key, outcome);
     for (const sessionId of [...this.#sessions.keys()]) {
       this.#sessions.delete(sessionId);
       this.#promptCursors.delete(sessionId);
@@ -922,66 +1083,146 @@ export class ClsSpanStore {
     if (flushError !== undefined) throw flushError;
   }
 
-  #closeStep(key: string, error: { type: string; message: string } | undefined): void {
+  #closeAttemptChildren(attemptId: string, error: TerminalError): void {
+    for (const [chatKey, chat] of this.#chats) {
+      if (chat.attemptId !== attemptId) continue;
+      this.#chats.delete(chatKey);
+      chat.span.setAttributes({
+        "gen_ai.chat.duration_ms": Date.now() - chat.startMs,
+        "gen_ai.response.finish_reasons": ["error"],
+        "error.type": error.type,
+      });
+      chat.span.setStatus({
+        code: SpanStatusCode.ERROR,
+        ...(error.message !== undefined ? { message: error.message } : {}),
+      });
+      chat.span.end();
+    }
+    for (const [toolKey, tool] of this.#tools) {
+      if (tool.attemptId !== attemptId) continue;
+      this.#tools.delete(toolKey);
+      this.#releaseActionIndex(tool);
+      tool.span.setAttributes({
+        "gen_ai.tool.call.duration_ms": Date.now() - tool.startMs,
+        "gen_ai.tool.error.type": error.type,
+        "error.type": error.type,
+      });
+      tool.span.setStatus({
+        code: SpanStatusCode.ERROR,
+        ...(error.message !== undefined ? { message: error.message } : {}),
+      });
+      tool.span.end();
+    }
+  }
+
+  #closeStep(key: string, error: TerminalError | undefined, finishReason?: string): boolean {
     const step = this.#steps.get(key);
-    if (step === undefined) return;
+    if (step === undefined) return false;
     this.#steps.delete(key);
-    step.span.setAttribute("gen_ai.react.finish_reason", error !== undefined ? "error" : step.lastFinishReason);
+    step.span.setAttribute(
+      "gen_ai.react.finish_reason",
+      finishReason ?? (error !== undefined ? "error" : step.lastFinishReason),
+    );
     if (step.observations.length > 0 && this.#config.recordOutputs) {
       const json = cappedJson(step.observations, this.#config.maxContentLength);
       if (json !== undefined) step.span.setAttribute("gen_ai.react.observation", json);
     }
     if (error !== undefined) {
-      step.span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
+      step.span.setStatus({
+        code: SpanStatusCode.ERROR,
+        ...(error.message !== undefined ? { message: error.message } : {}),
+      });
     } else {
       step.span.setStatus({ code: SpanStatusCode.OK });
     }
     step.span.end();
+    return true;
   }
 
-  #closeTurn(key: string, error: { type: string; message: string } | undefined): void {
+  #closeTurn(key: string, outcome: TurnOutcome): void {
     const turn = this.#turns.get(key);
     if (turn === undefined) return;
-    this.#turns.delete(key);
-    this.#untrackSessionTurn(turn.sessionId, key);
+
+    const terminalError: TerminalError | undefined =
+      outcome.kind === "failed"
+        ? (outcome.error ?? { type: "TurnFailed" })
+        : outcome.kind === "abandoned"
+          ? outcome.error
+          : undefined;
 
     // Force-close anything still open under this turn (orphans on failure paths).
     // Children must end before their parent step to preserve temporal validity.
     for (const [chatKey, chat] of this.#chats) {
       if (chat.turnKey === key) {
         this.#chats.delete(chatKey);
-        chat.span.setStatus({ code: SpanStatusCode.ERROR, message: "turn ended before model call settled" });
+        if (outcome.kind === "cancelled") {
+          chat.span.setAttributes({
+            "gen_ai.chat.duration_ms": Date.now() - chat.startMs,
+            "gen_ai.response.finish_reasons": ["cancelled"],
+          });
+          chat.span.setStatus({ code: SpanStatusCode.UNSET });
+        } else {
+          chat.span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: "turn ended before model call settled",
+          });
+        }
         chat.span.end();
       }
     }
     for (const [toolKey, tool] of this.#tools) {
       if (tool.turnKey === key) {
         this.#tools.delete(toolKey);
-        tool.span.setStatus({ code: SpanStatusCode.ERROR, message: "turn ended before tool call settled" });
+        this.#releaseActionIndex(tool);
+        if (outcome.kind === "cancelled") {
+          tool.span.setAttributes({
+            "gen_ai.tool.call.duration_ms": Date.now() - tool.startMs,
+            "agent.eve.action.outcome": "cancelled",
+          });
+          tool.span.setStatus({ code: SpanStatusCode.UNSET });
+        } else {
+          tool.span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: "turn ended before tool call settled",
+          });
+        }
         tool.span.end();
       }
     }
     for (const [stepKey, step] of this.#steps) {
-      if (step.turnKey === key) this.#closeStep(stepKey, error);
+      if (step.turnKey === key) {
+        this.#closeStep(
+          stepKey,
+          terminalError,
+          outcome.kind === "cancelled" ? "cancelled" : undefined,
+        );
+      }
     }
 
+    const usage = {
+      inputTokens: observedUsage(turn.usage.inputTokens),
+      outputTokens: observedUsage(turn.usage.outputTokens),
+      cacheReadTokens: observedUsage(turn.usage.cacheReadTokens),
+      cacheWriteTokens: observedUsage(turn.usage.cacheWriteTokens),
+    };
     turn.agentSpan.setAttributes({
       "gen_ai.agent.message_count": turn.messageCount,
       "gen_ai.agent.tool_call_count": turn.toolCallCount,
+      "agent.eve.turn.outcome": outcome.kind,
       ...(turn.costUsd > 0 ? { "gen_ai.usage.total_cost": turn.costUsd } : {}),
-      ...usageAttributes({
-        inputTokens: turn.usage.inputTokens,
-        outputTokens: turn.usage.outputTokens,
-        cacheReadTokens: turn.usage.cacheReadTokens,
-        cacheWriteTokens: turn.usage.cacheWriteTokens,
-      }),
+      ...(hasPartialUsage(turn.usage) ? { "agent.eve.usage.partial": true } : {}),
+      ...usageAttributes(usage),
     } as never);
 
-    if (error !== undefined) {
-      turn.agentSpan.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
-      turn.entrySpan?.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
-      turn.agentSpan.setAttribute("error.type", error.type);
-      turn.entrySpan?.setAttribute("error.type", error.type);
+    if (terminalError !== undefined) {
+      const status = {
+        code: SpanStatusCode.ERROR,
+        ...(terminalError.message !== undefined ? { message: terminalError.message } : {}),
+      };
+      turn.agentSpan.setStatus(status);
+      turn.entrySpan?.setStatus(status);
+      turn.agentSpan.setAttribute("error.type", terminalError.type);
+      turn.entrySpan?.setAttribute("error.type", terminalError.type);
     } else {
       turn.agentSpan.setStatus({ code: SpanStatusCode.OK });
       turn.entrySpan?.setStatus({ code: SpanStatusCode.OK });
@@ -989,15 +1230,14 @@ export class ClsSpanStore {
     this.#closeChain(turn);
     turn.agentSpan.end();
     turn.entrySpan?.end();
+    this.#turns.delete(key);
+    this.#untrackSessionTurn(turn.sessionId, key);
   }
 
-  async #closeSession(
-    sessionId: string,
-    error: { type: string; message: string } | undefined,
-  ): Promise<void> {
+  async #closeSession(sessionId: string, outcome: TurnOutcome): Promise<void> {
     const turnKeys = this.#sessionTurns.get(sessionId);
     if (turnKeys !== undefined) {
-      for (const key of [...turnKeys]) await this.#closeTurn(key, error);
+      for (const key of [...turnKeys]) this.#closeTurn(key, outcome);
     }
     this.#sessionTurns.delete(sessionId);
     this.#sessions.delete(sessionId);
@@ -1024,6 +1264,7 @@ export class ClsSpanStore {
     const result: Record<string, string> = {
       "gen_ai.input.messages.hash": advance.hash,
     };
+    if (advance.kind === "stale") return result;
     if (this.#config.messageDelta && advance.kind === "delta") {
       const delta = cappedJson(
         [{ type: "append", messages: advance.messages }],
@@ -1047,23 +1288,93 @@ export class ClsSpanStore {
     turn.agentSpan.setAttributes(attrs as never);
   }
 
+  #releaseActionIndex(tool: ChildSpanState): void {
+    if (tool.actionKey === undefined) return;
+    this.#toolByActionKey.delete(tool.actionKey);
+    const context = tool.span.spanContext();
+    const turn = this.#turns.get(tool.turnKey);
+    const clsSessionId = turn?.clsSessionId ?? tool.turnKey.split("|")[0] ?? "unknown";
+    const clsTurnId = turn?.clsTurnId ?? tool.turnKey.replace("|", ":");
+    const stepIndex = Number(tool.stepKey?.split("|").at(-1) ?? 0);
+    this.#closedActionParents.set(tool.actionKey, {
+      traceId: context.traceId,
+      spanId: context.spanId,
+      traceFlags: context.traceFlags,
+      createdAtMs: Date.now(),
+      sessionId: clsSessionId,
+      turnId: clsTurnId,
+      stepId: clsStepId(clsTurnId, Number.isSafeInteger(stepIndex) ? stepIndex + 1 : 1),
+      callId: tool.callId ?? tool.actionKey.split(":").at(-1) ?? "unknown",
+    });
+    this.#pendingActionAttributes.delete(tool.actionKey);
+    while (this.#closedActionParents.size > this.#config.maxTrackedSessions * 16) {
+      const oldest = this.#closedActionParents.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.#closedActionParents.delete(oldest);
+    }
+  }
+
   #annotateAction(
     sessionId: string,
     turnId: string,
+    stepIndex: number,
     idempotencyKey: string,
     attributes: Attributes,
   ): void {
-    const callId = idempotencyKey.split(":").pop();
-    if (callId === undefined) return;
-    for (const tool of this.#tools.values()) {
-      if (
-        tool.turnKey === turnKeyOf(sessionId, turnId) &&
-        (tool.callId === callId || idempotencyKey.endsWith(`:${tool.callId ?? ""}`))
-      ) {
-        tool.span.setAttributes(attributes);
-        tool.span.addEvent("action.terminal", attributes);
-        return;
-      }
+    const toolKey = this.#toolByActionKey.get(idempotencyKey);
+    const tool = toolKey !== undefined ? this.#tools.get(toolKey) : undefined;
+    if (tool !== undefined) {
+      tool.span.setAttributes(attributes);
+      tool.span.addEvent("action.terminal", attributes);
+      return;
+    }
+    const closedParent = this.#closedActionParents.get(idempotencyKey);
+    if (closedParent !== undefined) {
+      this.#closedActionParents.delete(idempotencyKey);
+      const parent = trace.setSpanContext(ROOT_CONTEXT, {
+        traceId: closedParent.traceId,
+        spanId: closedParent.spanId,
+        traceFlags: closedParent.traceFlags,
+        isRemote: true,
+      });
+      const outcome = attributes["agent.eve.action.outcome"];
+      const actionOutcome = typeof outcome === "string" ? outcome : "terminal";
+      const span = this.#pipeline.tracer.startSpan(
+        `chain eve.action.${actionOutcome}`,
+        {
+          kind: SpanKind.INTERNAL,
+          attributes: {
+            // `chain` is a CLS compatibility classification, not an OTel
+            // GenAI well-known operation. Use a namespaced custom operation.
+            "gen_ai.span.kind": "chain",
+            "gen_ai.operation.name": "eve.action",
+            "gen_ai.chain.name": `eve.action.${actionOutcome}`,
+            "gen_ai.tool.call.id": closedParent.callId,
+            "agent.eve.span.origin": "synthesized",
+            ...identityAttributes({
+              sessionId: closedParent.sessionId,
+              clsTurnId: closedParent.turnId,
+              clsStepId: closedParent.stepId,
+            }),
+            ...attributes,
+          },
+        },
+        parent,
+      );
+      span.setStatus(
+        outcome === "failed" || outcome === "abandoned" || outcome === "rejected"
+          ? { code: SpanStatusCode.ERROR }
+          : { code: SpanStatusCode.OK },
+      );
+      span.end();
+      return;
+    }
+    const pending = this.#pendingActionAttributes.get(idempotencyKey);
+    this.#pendingActionAttributes.set(idempotencyKey, { ...pending, ...attributes });
+    while (this.#pendingActionAttributes.size > this.#config.maxTrackedSessions * 16) {
+      const oldest = this.#pendingActionAttributes.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.#pendingActionAttributes.delete(oldest);
     }
   }
 
@@ -1072,32 +1383,66 @@ export class ClsSpanStore {
     durable: DurableChildSnapshot,
     destination: Map<string, ChildSpanState>,
   ): ChildSpanState {
-    const parent = trace.setSpanContext(ROOT_CONTEXT, {
+    const previousContext = {
       traceId: durable.traceId,
       spanId: durable.parentSpanId,
       traceFlags: durable.traceFlags,
       isRemote: true,
-    });
+    };
+    const currentStep = this.#steps.get(durable.stepKey);
+    const currentTurn = this.#turns.get(durable.turnKey);
+    const currentParent =
+      currentStep !== undefined
+        ? this.#parentOf(currentStep.span)
+        : currentTurn !== undefined
+          ? this.#parentOf(currentTurn.agentSpan)
+          : ROOT_CONTEXT;
+    const hasCurrentParent = currentStep !== undefined || currentTurn !== undefined;
     const span = this.#pipeline.tracer.startSpan(
       durable.name,
       {
         kind: SpanKind.CLIENT,
         startTime: durable.startMs,
+        links: [{ context: previousContext }],
         attributes: {
           ...durable.attributes,
           "agent.eve.resumed": true,
+          ...(!hasCurrentParent ? { "agent.eve.resumed.orphan": true } : {}),
         } as Attributes,
       },
-      parent,
+      currentParent,
     );
+    const actionKey =
+      durable.operation === "tool" &&
+      durable.callId !== undefined &&
+      durable.sessionId !== undefined &&
+      durable.turnId !== undefined
+        ? actionKeyOf(durable.sessionId, durable.turnId, durable.callId)
+        : undefined;
     const state: ChildSpanState = {
       span,
       startMs: durable.startMs,
+      ...(durable.attemptId !== undefined ? { attemptId: durable.attemptId } : {}),
       stepKey: durable.stepKey,
       turnKey: durable.turnKey,
       ...(durable.toolName !== undefined ? { name: durable.toolName } : {}),
+      ...(durable.callId !== undefined ? { callId: durable.callId } : {}),
+      ...(actionKey !== undefined ? { actionKey } : {}),
     };
     destination.set(idempotencyKey, state);
+    if (destination === this.#tools && actionKey !== undefined) {
+      this.#toolByActionKey.set(actionKey, idempotencyKey);
+      const context = span.spanContext();
+      this.#toolSpanIndex.set(
+        `${durable.sessionId}|${durable.turnId}|${durable.callId}`,
+        {
+          traceId: context.traceId,
+          spanId: context.spanId,
+          traceFlags: context.traceFlags,
+          createdAtMs: Date.now(),
+        },
+      );
+    }
     return state;
   }
 
@@ -1117,8 +1462,10 @@ export class ClsSpanStore {
         kind: SpanKind.INTERNAL,
         startTime: startMs,
         attributes: {
+          // CLS uses `chain` to render framework orchestration. OTel GenAI
+          // has no well-known `chain` operation, so this stays namespaced.
           "gen_ai.span.kind": "chain",
-          "gen_ai.operation.name": "chain",
+          "gen_ai.operation.name": "eve.orchestration",
           "gen_ai.chain.name": `eve.${phase}`,
           "agent.eve.span.origin": "synthesized",
           "agent.eve.phase": phase,
@@ -1136,10 +1483,40 @@ export class ClsSpanStore {
     turn.pendingChain = undefined;
   }
 
+  #maintainActiveState(sessionId: string, turnId: string): void {
+    const now = Date.now();
+    const turn = this.#turns.get(turnKeyOf(sessionId, turnId));
+    if (turn !== undefined) turn.updatedAtMs = now;
+    const session = this.#sessions.get(sessionId);
+    if (session !== undefined) session.updatedAtMs = now;
+    this.#evictStaleState();
+  }
+
   #evictStaleState(): void {
     const cutoff = Date.now() - this.#config.stateTtlMs;
+    const abandoned = {
+      kind: "abandoned",
+      error: { type: "StateExpired", message: "instrumentation state exceeded its idle TTL" },
+    } as const;
+    for (const [key, turn] of [...this.#turns]) {
+      if (turn.updatedAtMs < cutoff) this.#closeTurn(key, abandoned);
+    }
     for (const [key, value] of this.#toolSpanIndex) {
       if (value.createdAtMs < cutoff) this.#toolSpanIndex.delete(key);
+    }
+    for (const [key, value] of this.#closedActionParents) {
+      if (value.createdAtMs < cutoff) this.#closedActionParents.delete(key);
+    }
+    while (this.#pendingActionAttributes.size > this.#config.maxTrackedSessions * 16) {
+      const oldest = this.#pendingActionAttributes.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.#pendingActionAttributes.delete(oldest);
+    }
+    for (const [sessionId, session] of [...this.#sessions]) {
+      if (session.updatedAtMs < cutoff && !this.#sessionTurns.has(sessionId)) {
+        this.#sessions.delete(sessionId);
+        this.#promptCursors.delete(sessionId);
+      }
     }
     while (this.#toolSpanIndex.size > this.#config.maxTrackedSessions * 16) {
       const oldest = this.#toolSpanIndex.keys().next().value as string | undefined;
@@ -1149,6 +1526,10 @@ export class ClsSpanStore {
     while (this.#sessions.size > this.#config.maxTrackedSessions) {
       const oldest = this.#sessions.keys().next().value as string | undefined;
       if (oldest === undefined) break;
+      const turnKeys = this.#sessionTurns.get(oldest);
+      if (turnKeys !== undefined) {
+        for (const key of [...turnKeys]) this.#closeTurn(key, abandoned);
+      }
       this.#sessions.delete(oldest);
       this.#promptCursors.delete(oldest);
     }
@@ -1162,6 +1543,8 @@ export class ClsSpanStore {
   }
 
   #untrackSessionTurn(sessionId: string, turnKey: string): void {
-    this.#sessionTurns.get(sessionId)?.delete(turnKey);
+    const turns = this.#sessionTurns.get(sessionId);
+    turns?.delete(turnKey);
+    if (turns?.size === 0) this.#sessionTurns.delete(sessionId);
   }
 }

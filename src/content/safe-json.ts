@@ -19,78 +19,140 @@ export function utf8Prefix(value: string, maxBytes: number): string {
   return value.slice(0, low);
 }
 
-function normalize(value: unknown, seen: WeakSet<object>): unknown {
-  if (typeof value === "bigint") return value.toString();
-  if (value instanceof Error) {
-    return { name: value.name, message: value.message };
+interface NormalizeState {
+  readonly seen: WeakSet<object>;
+  readonly maxNodes: number;
+  nodes: number;
+  remainingBytes: number;
+  truncated: boolean;
+}
+
+const MAX_DEPTH = 64;
+const TRUNCATED = "[Truncated]";
+const STRING_MARKER = "… [truncated]";
+
+function boundedString(value: string, state: NormalizeState): string {
+  const bytes = byteLength(value);
+  if (bytes <= state.remainingBytes) {
+    state.remainingBytes -= bytes;
+    return value;
   }
-  if (typeof value !== "object" || value === null) return value;
-  if (seen.has(value)) return "[Circular]";
-  seen.add(value);
-  if (Array.isArray(value)) return value.map((item) => normalize(item, seen));
+  state.truncated = true;
+  const markerBytes = byteLength(STRING_MARKER);
+  const result = `${utf8Prefix(value, Math.max(0, state.remainingBytes - markerBytes))}${STRING_MARKER}`;
+  state.remainingBytes = Math.max(0, state.remainingBytes - byteLength(result));
+  return result;
+}
+
+function normalize(value: unknown, state: NormalizeState, depth = 0): unknown {
+  if (state.nodes >= state.maxNodes || state.remainingBytes <= 0) {
+    state.truncated = true;
+    return TRUNCATED;
+  }
+  state.nodes += 1;
+
+  if (typeof value === "string") return boundedString(value, state);
+  if (typeof value === "bigint") return boundedString(value.toString(), state);
+  if (typeof value === "function" || typeof value === "symbol" || value === undefined) {
+    state.truncated = true;
+    return "[Unsupported]";
+  }
+  if (typeof value !== "object" || value === null) {
+    state.remainingBytes = Math.max(0, state.remainingBytes - 8);
+    return value;
+  }
+  if (value instanceof Error) {
+    return {
+      name: boundedString(value.name, state),
+      message: boundedString(value.message, state),
+    };
+  }
+  if (state.seen.has(value)) return "[Circular]";
+  if (depth >= MAX_DEPTH) {
+    state.truncated = true;
+    return TRUNCATED;
+  }
+
+  state.seen.add(value);
+  if (Array.isArray(value)) {
+    const output: unknown[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      if (state.nodes >= state.maxNodes || state.remainingBytes <= 0) {
+        output.push(TRUNCATED);
+        state.truncated = true;
+        break;
+      }
+      try {
+        output.push(normalize(value[index], state, depth + 1));
+      } catch {
+        output.push("[Unserializable]");
+        state.truncated = true;
+      }
+    }
+    return output;
+  }
+
   const output: Record<string, unknown> = {};
-  for (const [key, item] of Object.entries(value)) {
-    output[key] = normalize(item, seen);
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      state.truncated = true;
+      return "[UnsupportedObject]";
+    }
+    for (const key in value) {
+      if (state.nodes >= state.maxNodes || state.remainingBytes <= 0) {
+        output.__truncated__ = true;
+        state.truncated = true;
+        break;
+      }
+      state.nodes += 1;
+      if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+      state.remainingBytes = Math.max(0, state.remainingBytes - byteLength(key));
+      try {
+        output[key] = normalize((value as Record<string, unknown>)[key], state, depth + 1);
+      } catch {
+        output[key] = "[Unserializable]";
+        state.truncated = true;
+      }
+    }
+  } catch {
+    state.truncated = true;
+    return "[Unserializable]";
   }
   return output;
 }
 
-function truncateStrings(value: unknown, maxStringBytes: number): unknown {
-  if (typeof value === "string" && byteLength(value) > maxStringBytes) {
-    const marker = "… [truncated]";
-    return `${utf8Prefix(value, Math.max(0, maxStringBytes - byteLength(marker)))}${marker}`;
-  }
-  if (Array.isArray(value)) return value.map((item) => truncateStrings(item, maxStringBytes));
-  if (typeof value === "object" && value !== null) {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [key, truncateStrings(item, maxStringBytes)]),
-    );
-  }
-  return value;
-}
-
 /**
  * Serializes arbitrary input as valid JSON within a UTF-8 byte ceiling.
- * Circular references, BigInt and Error objects are safe. If deep string
- * truncation is insufficient, arrays retain a valid prefix plus a marker;
- * other values become a valid preview envelope.
+ * Traversal is bounded by depth, visited value count and an approximate byte
+ * budget before stringification, preventing oversized values from monopolizing
+ * the event loop or overflowing the stack.
  */
 export function safeJsonAttribute(value: unknown, maxBytes: number): SafeJsonResult | undefined {
   if (value === undefined) return undefined;
-  const normalized = normalize(value, new WeakSet());
-  let json = JSON.stringify(normalized);
+  const state: NormalizeState = {
+    seen: new WeakSet(),
+    maxNodes: Math.max(64, Math.min(2_048, Math.floor(maxBytes / 8))),
+    nodes: 0,
+    remainingBytes: Math.max(64, maxBytes * 2),
+    truncated: false,
+  };
+  const normalized = normalize(value, state);
+  const json = JSON.stringify(normalized);
   if (json === undefined || json.length === 0) return undefined;
-  if (byteLength(json) <= maxBytes) return { json, truncated: false };
+  if (byteLength(json) <= maxBytes) return { json, truncated: state.truncated };
 
-  let stringLimit = Math.max(32, Math.floor(maxBytes / 2));
-  let candidate: unknown = normalized;
-  while (stringLimit >= 32) {
-    candidate = truncateStrings(normalized, stringLimit);
-    json = JSON.stringify(candidate);
-    if (byteLength(json) <= maxBytes) return { json, truncated: true };
-    stringLimit = Math.floor(stringLimit / 2);
-  }
-
-  if (Array.isArray(candidate)) {
-    const marker = { type: "truncated" };
-    const kept: unknown[] = [];
-    for (const item of candidate) {
-      const attempt = JSON.stringify([...kept, item, marker]);
-      if (byteLength(attempt) > maxBytes) break;
-      kept.push(item);
-    }
-    json = JSON.stringify([...kept, marker]);
-    if (byteLength(json) <= maxBytes) return { json, truncated: true };
-  }
-
-  const prefixBudget = Math.max(0, maxBytes - 36);
-  let preview = utf8Prefix(JSON.stringify(normalized), prefixBudget);
-  json = JSON.stringify({ truncated: true, preview });
-  while (byteLength(json) > maxBytes && preview.length > 0) {
+  const envelopeOverhead = byteLength(JSON.stringify({ truncated: true, preview: "" }));
+  let preview = utf8Prefix(json, Math.max(0, maxBytes - envelopeOverhead));
+  let result = JSON.stringify({ truncated: true, preview });
+  while (byteLength(result) > maxBytes && preview.length > 0) {
     preview = utf8Prefix(preview, Math.max(0, byteLength(preview) - 16));
-    json = JSON.stringify({ truncated: true, preview });
+    result = JSON.stringify({ truncated: true, preview });
   }
-  return { json, truncated: true };
+  return {
+    json: byteLength(result) <= maxBytes ? result : "null",
+    truncated: true,
+  };
 }
 
 export function safeString(value: unknown): string {
