@@ -1,11 +1,12 @@
 # Changelog
 
-## 0.3.0 - Unreleased
+## 0.3.0 - 2026-10-30
 
 ### Added
 
 - Report chat first-response latency as `gen_ai.response.time_to_first_token_ms` when Eve exposes `model.call.completed.timeToFirstResponseMs`. Streaming calls use the first generated output chunk; non-streaming calls use complete response latency.
 - Preserve backward compatibility with older Eve versions by omitting the metric when it is unavailable.
+- Add a dedicated customer guide covering metric semantics, Eve source changes, compatibility behavior, diagrams, and real-model verification.
 
 ## 0.2.0 - 2026-09-21
 

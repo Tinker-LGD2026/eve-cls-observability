@@ -18,6 +18,7 @@ export default clsObservability(); // 配置走环境变量，开箱即用
 - [它能给你什么](#它能给你什么)
 - [快速开始（5 分钟）](#快速开始5-分钟)
 - [工作原理](#工作原理)
+- [Chat 首响应耗时（可选）](https://github.com/Tinker-LGD2026/eve-cls-observability/blob/main/docs/first-response-latency.md)
 - [完整配置项](#完整配置项)
 - [客户可以自定义什么](#客户可以自定义什么)
 - [内容采集与隐私](#内容采集与隐私)
@@ -36,6 +37,7 @@ export default clsObservability(); // 配置走环境变量，开箱即用
 | 完整调用链 | 一次用户请求从入口到每次模型调用、工具调用的五层 span 树（entry → agent → step → chat / tool） |
 | 多轮会话聚合 | 同一会话的多轮对话聚合为一个 Session，按 `session.id` 检索 |
 | Token 与成本 | 每次模型调用的输入/输出 token 数，agent 级自动汇总 |
+| 首响应耗时（可选） | Eve 提供性能字段时，chat span 上报 `gen_ai.response.time_to_first_token_ms`；旧 Eve 自动省略，不影响其他功能 |
 | 失败可定位 | 模型/工具调用失败带 `error.*` 分类字段，step 级 `finish_reason` |
 | 工具调用详情 | 工具名、入参、返回结果、耗时，子 agent 派发自动嵌套为 `invoke_subagent` 子树 |
 | 思考过程 | step 级 `react.thought` / `react.observation`（推理与工具观察回填） |
@@ -145,7 +147,7 @@ CLS_OBS_DEBUG=1 npm run dev
 
 > `gen_ai.span.kind` 和 `chain` 是 CLS 的兼容分类，不是 OpenTelemetry GenAI 官方属性/操作。OpenTelemetry 允许在没有适用 well-known value 时使用自定义 operation，因此插件对 eve 内部编排使用带命名空间的 `eve.orchestration` / `eve.action`，避免冒充官方 `invoke_workflow`（后者只适用于用户定义的可组合工作流）。
 >
-> 支持首响应性能字段的 Eve 版本会把 AI SDK 的性能数据透传为 `timeToFirstResponseMs`：流式调用采用 `performance.timeToFirstOutputMs`（Provider 调用开始到首个生成输出 chunk，包含文本、推理、文件或 tool call），非流式调用采用 `performance.responseTimeMs`（完整响应返回耗时）。插件将其写入 chat span 的 `gen_ai.response.time_to_first_token_ms`；它不是严格意义上的首个可见文本 Token。旧 Eve 未提供该值或流式调用没有生成输出时，插件省略字段而不是写 `0`。
+> 支持首响应性能字段的 Eve 版本会把 AI SDK 的性能数据透传为 `timeToFirstResponseMs`：流式调用采用 `performance.timeToFirstOutputMs`（Provider 调用开始到首个生成输出 chunk，包含文本、推理、文件或 tool call），非流式调用采用 `performance.responseTimeMs`（完整响应返回耗时）。插件将其写入 chat span 的 `gen_ai.response.time_to_first_token_ms`；它不是严格意义上的首个可见文本 Token。旧 Eve 未提供该值或流式调用没有生成输出时，插件省略字段而不是写 `0`。完整取值逻辑和 Eve 源码修改步骤见 [Chat 首响应耗时接入指南](https://github.com/Tinker-LGD2026/eve-cls-observability/blob/main/docs/first-response-latency.md)。
 
 span 之间通过 ID 链关联：`turn.id = {sessionId}:t{N}`、`step.id = {turnId}:s{N}`，控制台上因此能还原出完整的树状时间线。属性命名遵循 `gen_ai.*` 协议命名空间（OpenTelemetry GenAI 语义约定），eve 框架的扩展信息放在 `agent.eve.*` 下（如 `agent.eve.turn.sequence`、`agent.eve.channel.type`）。
 
