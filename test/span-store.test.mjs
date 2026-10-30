@@ -195,26 +195,29 @@ test("chat span reports provider time to first response without output capture",
   await provider.shutdown();
 });
 
-test("chat span leaves first response timing absent when Eve does not report it", async () => {
-  const { store, exporter, provider } = createHarness();
-  store.onTurnStarted(turnStarted());
-  store.onStepStarted(stepStarted);
-  store.onModelCallStarted(modelStarted);
-  store.onModelCallCompleted({
-    type: "model.call.completed",
-    idempotencyKey: "model-call-1",
-    finishReason: "stop",
-    scope,
-    usage: {},
-  });
-  store.onStepCompleted(stepCompleted);
-  store.onTurnSettled(turnTerminal("turn.completed"));
-  await provider.forceFlush();
+test("chat span leaves first response timing absent when Eve does not report a valid value", async () => {
+  for (const timeToFirstResponseMs of [undefined, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const { store, exporter, provider } = createHarness();
+    store.onTurnStarted(turnStarted());
+    store.onStepStarted(stepStarted);
+    store.onModelCallStarted(modelStarted);
+    store.onModelCallCompleted({
+      type: "model.call.completed",
+      idempotencyKey: "model-call-1",
+      finishReason: "stop",
+      ...(timeToFirstResponseMs !== undefined ? { timeToFirstResponseMs } : {}),
+      scope,
+      usage: {},
+    });
+    store.onStepCompleted(stepCompleted);
+    store.onTurnSettled(turnTerminal("turn.completed"));
+    await provider.forceFlush();
 
-  const chat = findSpan(exporter, "chat");
-  assert.ok(chat);
-  assert.equal(hasOwn(chat.attributes, "gen_ai.response.time_to_first_token_ms"), false);
-  await provider.shutdown();
+    const chat = findSpan(exporter, "chat");
+    assert.ok(chat);
+    assert.equal(hasOwn(chat.attributes, "gen_ai.response.time_to_first_token_ms"), false);
+    await provider.shutdown();
+  }
 });
 
 test("unknown model usage is not reported as zero on the agent span", async () => {

@@ -145,7 +145,7 @@ CLS_OBS_DEBUG=1 npm run dev
 
 > `gen_ai.span.kind` 和 `chain` 是 CLS 的兼容分类，不是 OpenTelemetry GenAI 官方属性/操作。OpenTelemetry 允许在没有适用 well-known value 时使用自定义 operation，因此插件对 eve 内部编排使用带命名空间的 `eve.orchestration` / `eve.action`，避免冒充官方 `invoke_workflow`（后者只适用于用户定义的可组合工作流）。
 >
-> 支持首响应性能字段的 Eve 版本会把 AI SDK 的 `performance.responseTimeMs` 透传为 `timeToFirstResponseMs`。插件将其写入 chat span 的 `gen_ai.response.time_to_first_token_ms`：流式调用表示 Provider 调用开始到首个响应 chunk，非流式调用表示完整响应返回耗时；它不是严格意义上的首个可见文本 Token。旧 Eve 未提供该值时，插件省略字段而不是写 `0`。
+> 支持首响应性能字段的 Eve 版本会把 AI SDK 的性能数据透传为 `timeToFirstResponseMs`：流式调用采用 `performance.timeToFirstOutputMs`（Provider 调用开始到首个生成输出 chunk，包含文本、推理、文件或 tool call），非流式调用采用 `performance.responseTimeMs`（完整响应返回耗时）。插件将其写入 chat span 的 `gen_ai.response.time_to_first_token_ms`；它不是严格意义上的首个可见文本 Token。旧 Eve 未提供该值或流式调用没有生成输出时，插件省略字段而不是写 `0`。
 
 span 之间通过 ID 链关联：`turn.id = {sessionId}:t{N}`、`step.id = {turnId}:s{N}`，控制台上因此能还原出完整的树状时间线。属性命名遵循 `gen_ai.*` 协议命名空间（OpenTelemetry GenAI 语义约定），eve 框架的扩展信息放在 `agent.eve.*` 下（如 `agent.eve.turn.sequence`、`agent.eve.channel.type`）。
 

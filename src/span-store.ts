@@ -188,6 +188,17 @@ function modelCallSequence(idempotencyKey: string): number {
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
+function modelTimeToFirstResponseMs(
+  event: InstrumentationModelCallCompletedEvent,
+): number | undefined {
+  const value = (
+    event as InstrumentationModelCallCompletedEvent & {
+      readonly timeToFirstResponseMs?: unknown;
+    }
+  ).timeToFirstResponseMs;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
 /** Maps an eve channel kind onto the CLS entry-type vocabulary. */
 function entryTypeOf(channelKind: string | undefined): string {
   if (channelKind === undefined) return "api";
@@ -792,12 +803,13 @@ export class ClsSpanStore {
     this.#chats.delete(event.idempotencyKey);
     const turn = this.#turns.get(state.turnKey);
     const finishReason = normalizeFinishReason(event.finishReason);
+    const timeToFirstResponseMs = modelTimeToFirstResponseMs(event);
 
     const attributes: Record<string, unknown> = {
       "gen_ai.response.finish_reasons": [finishReason],
       "gen_ai.chat.duration_ms": Date.now() - state.startMs,
-      ...(event.timeToFirstResponseMs !== undefined
-        ? { "gen_ai.response.time_to_first_token_ms": event.timeToFirstResponseMs }
+      ...(timeToFirstResponseMs !== undefined
+        ? { "gen_ai.response.time_to_first_token_ms": timeToFirstResponseMs }
         : {}),
       ...usageFromEvent(event.usage),
     };
