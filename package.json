@@ -1,6 +1,6 @@
 {
   "name": "eve-cls-observability",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Tencent Cloud CLS Agent observability provider for eve agents. Emits CLS Agent Trace spec spans over the native UploadLog API with a zero-dependency client.",
   "type": "module",
   "main": "./dist/index.js",

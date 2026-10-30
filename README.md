@@ -137,13 +137,15 @@ CLS_OBS_DEBUG=1 npm run dev
 | session 开始/结束 | `entry`（应用入口） | `enter_application` | `session.id`、`turn.id`、轮级输入/输出消息 |
 | turn 开始/结束 | `agent` | `invoke_agent {name}` | agent 名称、usage 汇总、消息数、工具调用数 |
 | step 尝试开始/结束 | `step`（ReAct 轮次） | `react round_{N}` | `step.id`、轮次号、`finish_reason` |
-| model.call 开始/结束 | `chat`（模型调用） | `chat {model}` | 模型名、输入/输出消息、token usage、耗时 |
+| model.call 开始/结束 | `chat`（模型调用） | `chat {model}` | 模型名、输入/输出消息、token usage、总耗时、首响应耗时 |
 | tool.call 开始/结束 | `tool`（工具调用） | `execute_tool {name}` | 工具名、入参、结果、耗时、错误分类 |
 | eve durable 编排窗口 | `chain`（CLS 兼容扩展） | `chain eve.{phase}` | `operation.name=eve.orchestration`、`chain.name=eve.session_init/eve.durable_orchestration` |
 | 晚到的 durable action 终态 | `chain`（CLS 兼容扩展） | `chain eve.action.{outcome}` | `operation.name=eve.action`、`chain.name=eve.action.completed/rejected/...` |
 | 子 agent 派发 | `tool` + 子树 | `invoke_subagent` | 子 agent 的完整调用链嵌套在派发它的 tool span 下 |
 
 > `gen_ai.span.kind` 和 `chain` 是 CLS 的兼容分类，不是 OpenTelemetry GenAI 官方属性/操作。OpenTelemetry 允许在没有适用 well-known value 时使用自定义 operation，因此插件对 eve 内部编排使用带命名空间的 `eve.orchestration` / `eve.action`，避免冒充官方 `invoke_workflow`（后者只适用于用户定义的可组合工作流）。
+>
+> 支持首响应性能字段的 Eve 版本会把 AI SDK 的 `performance.responseTimeMs` 透传为 `timeToFirstResponseMs`。插件将其写入 chat span 的 `gen_ai.response.time_to_first_token_ms`：流式调用表示 Provider 调用开始到首个响应 chunk，非流式调用表示完整响应返回耗时；它不是严格意义上的首个可见文本 Token。旧 Eve 未提供该值时，插件省略字段而不是写 `0`。
 
 span 之间通过 ID 链关联：`turn.id = {sessionId}:t{N}`、`step.id = {turnId}:s{N}`，控制台上因此能还原出完整的树状时间线。属性命名遵循 `gen_ai.*` 协议命名空间（OpenTelemetry GenAI 语义约定），eve 框架的扩展信息放在 `agent.eve.*` 下（如 `agent.eve.turn.sequence`、`agent.eve.channel.type`）。
 
@@ -464,7 +466,7 @@ spec:
 
 - **Node.js**：>= 24（与 eve 框架的运行时要求一致）
 - **模块格式**：ESM-only，请使用 `import`，不支持 CommonJS `require()`
-- **eve**：>= 0.56.0 < 0.57.0（peer dependency；eve 的 instrumentation API 尚处 experimental，跨 minor 版本可能有变动，故锁定小版本区间）
+- **eve**：>= 0.56.0 < 0.57.0（peer dependency；eve 的 instrumentation API 尚处 experimental，跨 minor 版本可能有变动，故锁定小版本区间）。首响应耗时仅在 Eve 提供 `model.call.completed.timeToFirstResponseMs` 时出现；旧版 Eve 仍可使用其他全部功能。
 - **与其他 instrumentation provider 共存**：`agent/instrumentation/` 目录可放多个 provider 文件，事件分发互不影响
 - **与既有 OpenTelemetry 体系共存**：本插件用独立 provider 写 CLS；如需同时写你自己的 OTel Collector，用 [OTLP 镜像](#otlp-镜像双写)或在 eve 中再注册一个标准 OTel provider
 
@@ -504,7 +506,7 @@ spec:
 
 ### 已知限制
 
-受 eve 框架公开 API 覆盖面所限，以下 CLS 规范字段暂不上报：`response.model`、`reasoning_output_tokens`、`time_to_first_token_ms`、`tool.definitions`、模型请求参数（temperature 等）、`user.name`。eve 后续版本开放相应事件后会补齐。
+受 eve 框架公开 API 覆盖面所限，以下 CLS 规范字段暂不上报：`reasoning_output_tokens`、`tool.definitions`、模型请求参数（temperature 等）、`user.name`。`gen_ai.response.model` 已在 Provider 返回实际模型 ID 时上报；`gen_ai.response.time_to_first_token_ms` 已在 Eve 提供首响应耗时时上报。
 
 ## 许可证
 

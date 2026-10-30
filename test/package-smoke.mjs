@@ -37,7 +37,7 @@ try {
   );
   await writeFile(
     join(temp, "consumer.mjs"),
-    'import { createRequire } from "node:module";\nimport { clsObservability } from "eve-cls-observability";\nif (typeof clsObservability !== "function") throw new Error("missing export");\nconst pkg=createRequire(import.meta.url)("eve-cls-observability/package.json");\nif (pkg.version !== "0.2.0") throw new Error(`wrong version: ${pkg.version}`);\n',
+    `import { createRequire } from "node:module";\nimport { clsObservability } from "eve-cls-observability";\nif (typeof clsObservability !== "function") throw new Error("missing export");\nconst pkg=createRequire(import.meta.url)("eve-cls-observability/package.json");\nif (pkg.version !== ${JSON.stringify(projectPackage.version)}) throw new Error(\`wrong version: \${pkg.version}\`);\n`,
   );
   run("node", ["consumer.mjs"], temp);
 

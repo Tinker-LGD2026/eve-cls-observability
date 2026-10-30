@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createRequire } from "node:module";
 import test from "node:test";
 import { resolveConfig } from "../dist/config.js";
 import {
@@ -20,7 +21,8 @@ const config = (overrides = {}) => resolveConfig({
 });
 
 test("telemetry SDK version resolves from the installed package", () => {
-  assert.equal(SDK_VERSION, "0.2.0");
+  const packageVersion = createRequire(import.meta.url)("../package.json").version;
+  assert.equal(SDK_VERSION, packageVersion);
 });
 
 test("processor timeout covers the writer request and retry budget", () => {
