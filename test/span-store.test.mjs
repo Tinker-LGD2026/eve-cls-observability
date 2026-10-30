@@ -170,6 +170,53 @@ test("recordReasoning false excludes reasoning from chat and step spans", async 
   await provider.shutdown();
 });
 
+test("chat span reports provider time to first response without output capture", async () => {
+  const { store, exporter, provider } = createHarness({ recordOutputs: false });
+  store.onTurnStarted(turnStarted());
+  store.onStepStarted(stepStarted);
+  store.onModelCallStarted(modelStarted);
+  store.onModelCallCompleted({
+    type: "model.call.completed",
+    idempotencyKey: "model-call-1",
+    finishReason: "tool-calls",
+    timeToFirstResponseMs: 123.5,
+    scope,
+    usage: {},
+    content: [{ type: "tool-call", callId: "call-1", toolName: "lookup", input: {} }],
+  });
+  store.onStepCompleted(stepCompleted);
+  store.onTurnSettled(turnTerminal("turn.completed"));
+  await provider.forceFlush();
+
+  const chat = findSpan(exporter, "chat");
+  assert.ok(chat);
+  assert.equal(chat.attributes["gen_ai.response.time_to_first_token_ms"], 123.5);
+  assert.equal(hasOwn(chat.attributes, "gen_ai.output.messages"), false);
+  await provider.shutdown();
+});
+
+test("chat span leaves first response timing absent when Eve does not report it", async () => {
+  const { store, exporter, provider } = createHarness();
+  store.onTurnStarted(turnStarted());
+  store.onStepStarted(stepStarted);
+  store.onModelCallStarted(modelStarted);
+  store.onModelCallCompleted({
+    type: "model.call.completed",
+    idempotencyKey: "model-call-1",
+    finishReason: "stop",
+    scope,
+    usage: {},
+  });
+  store.onStepCompleted(stepCompleted);
+  store.onTurnSettled(turnTerminal("turn.completed"));
+  await provider.forceFlush();
+
+  const chat = findSpan(exporter, "chat");
+  assert.ok(chat);
+  assert.equal(hasOwn(chat.attributes, "gen_ai.response.time_to_first_token_ms"), false);
+  await provider.shutdown();
+});
+
 test("unknown model usage is not reported as zero on the agent span", async () => {
   const { store, exporter, provider } = createHarness();
   store.onTurnStarted(turnStarted());
@@ -400,6 +447,7 @@ test("default-content model failure keeps structural error fields", async () => 
   assert.deepEqual(chat.attributes["gen_ai.response.finish_reasons"], ["error"]);
   assert.equal(chat.attributes["error.type"], "ModelCallFailed");
   assert.equal(typeof chat.attributes["gen_ai.chat.duration_ms"], "number");
+  assert.equal(hasOwn(chat.attributes, "gen_ai.response.time_to_first_token_ms"), false);
   await provider.shutdown();
 });
 
@@ -540,6 +588,7 @@ test("durable recovery never points at a missing parent span", async () => {
     type: "model.call.completed",
     idempotencyKey: "model-call-resumed",
     finishReason: "stop",
+    timeToFirstResponseMs: 77,
     scope,
     usage: {},
   }, {
@@ -569,6 +618,7 @@ test("durable recovery never points at a missing parent span", async () => {
   assert.equal(chat.spanContext().traceId, step.spanContext().traceId);
   assert.equal(chat.parentSpanContext?.spanId, step.spanContext().spanId);
   assert.equal(chat.attributes["agent.eve.resumed"], true);
+  assert.equal(chat.attributes["gen_ai.response.time_to_first_token_ms"], 77);
   await provider.shutdown();
 });
 

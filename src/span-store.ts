@@ -796,6 +796,9 @@ export class ClsSpanStore {
     const attributes: Record<string, unknown> = {
       "gen_ai.response.finish_reasons": [finishReason],
       "gen_ai.chat.duration_ms": Date.now() - state.startMs,
+      ...(event.timeToFirstResponseMs !== undefined
+        ? { "gen_ai.response.time_to_first_token_ms": event.timeToFirstResponseMs }
+        : {}),
       ...usageFromEvent(event.usage),
     };
     if (event.responseId !== undefined) attributes["gen_ai.response.id"] = event.responseId;
